@@ -451,12 +451,66 @@ namespace wxl::scripts::equipextension
         return true;
     }
 
+    static bool ContainsCI(const char* s, const char* needle) noexcept
+    {
+        if (!s || !needle || !*needle) return false;
+        for (const char* p = s; *p; ++p)
+        {
+            const char* a = p;
+            const char* b = needle;
+            while (*a && *b)
+            {
+                char ca = *a++;
+                char cb = *b++;
+                if (ca >= 'A' && ca <= 'Z') ca = static_cast<char>(ca - 'A' + 'a');
+                if (cb >= 'A' && cb <= 'Z') cb = static_cast<char>(cb - 'A' + 'a');
+                if (ca != cb) break;
+            }
+            if (!*b) return true;
+        }
+        return false;
+    }
+
+    static bool IsKnownObjectComponentFolder(const char* folder, size_t len) noexcept
+    {
+        static const char* kFolders[] = {
+            "Head", "Shoulder", "Shirt", "Chest", "Waist", "Leg", "Foot",
+            "Bracer", "Glove", "Cape", "Tabard", "Collections",
+        };
+
+        for (const char* known : kFolders)
+        {
+            size_t knownLen = std::strlen(known);
+            if (knownLen != len) continue;
+
+            bool match = true;
+            for (size_t i = 0; i < len; ++i)
+            {
+                char a = folder[i];
+                char b = known[i];
+                if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+                if (b >= 'A' && b <= 'Z') b = static_cast<char>(b - 'A' + 'a');
+                if (a != b)
+                {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return true;
+        }
+        return false;
+    }
+
     static const char* InferObjectComponentFolder(const char* name, bool isCollection,
                                                   const char* customFolder,
                                                   const char* slotFolder) noexcept
     {
         if (customFolder && *customFolder) return customFolder;
         if (isCollection) return "Collections";
+        if (StartsWithCI(name, "lshoulder_") || StartsWithCI(name, "rshoulder_") ||
+            StartsWithCI(name, "shoulder_") || ContainsCI(name, "_shoulder_l") ||
+            ContainsCI(name, "_shoulder_r"))
+            return "Shoulder";
         if (StartsWithCI(name, "cape_")) return "Cape";
         if (StartsWithCI(name, "tabard_")) return "Tabard";
         return slotFolder;
@@ -467,9 +521,44 @@ namespace wxl::scripts::equipextension
                                                uint32_t attach) noexcept
     {
         if (explicitAttach || isCollection) return attach;
+        if (StartsWithCI(name, "lshoulder_") || ContainsCI(name, "_shoulder_l")) return 6;
+        if (StartsWithCI(name, "rshoulder_") || ContainsCI(name, "_shoulder_r")) return 5;
+        if (StartsWithCI(name, "collections_"))
+        {
+            if (ContainsCI(name, "_shoulder_l")) return 6;
+            if (ContainsCI(name, "_shoulder_r")) return 5;
+            if (StartsWithCI(name, "collections_belt_") || ContainsCI(name, "_belt")) return 53;
+        }
         if (StartsWithCI(name, "cape_")) return 12;
         if (StartsWithCI(name, "tabard_")) return 34;
         return attach;
+    }
+
+    static bool SlotAllowsNormalObjectModel(uint32_t modelSlot) noexcept
+    {
+        switch (modelSlot)
+        {
+            case 0:  // Head
+            case 1:  // Shoulder
+            case 4:  // Waist / 3D belts
+            case 9:  // Back/cape
+            case 10: // Tabard
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    static bool IsCollectionObjectPath(const char* path) noexcept
+    {
+        return ContainsCI(path, "objectcomponents\\collections\\") ||
+               ContainsCI(path, "objectcomponents/collections/");
+    }
+
+    static bool NeedsVirtualModel(const AttachEntry& e) noexcept
+    {
+        return e.geoFilter.count > 0 ||
+               (e.texBuf[0] && IsCollectionObjectPath(e.keyBuf));
     }
 
     static void AnalyzeModelList(const char* list, bool* hasCollection, bool* hasNormal)
@@ -543,8 +632,25 @@ namespace wxl::scripts::equipextension
         bool subFolder    = (flags & 0x20) != 0;
         bool newSuffix    = (flags & 0x40) != 0;
 
-        const char* subBase = (modelStem && *modelStem) ? modelStem : texName;
+        char explicitFolder[32] = {};
+        const char* texStem = texName;
+        for (const char* s = texName; *s; ++s)
+        {
+            if (*s != '\\' && *s != '/') continue;
+            size_t folderLen = static_cast<size_t>(s - texName);
+            if (folderLen > 0 && folderLen < sizeof(explicitFolder)
+                && IsKnownObjectComponentFolder(texName, folderLen))
+            {
+                std::memcpy(explicitFolder, texName, folderLen);
+                explicitFolder[folderLen] = '\0';
+                texStem = s + 1;
+            }
+            break;
+        }
+
+        const char* subBase = (modelStem && *modelStem) ? modelStem : texStem;
         const char* folder = InferObjectComponentFolder(subBase, isCollection, customFolder, slotFolder);
+        if (explicitFolder[0]) folder = explicitFolder;
         size_t subBaseLen = std::strlen(subBase);
         for (const char* s = subBase; *s; s++)
             if (*s == '.') { subBaseLen = static_cast<size_t>(s - subBase); break; }
@@ -559,7 +665,7 @@ namespace wxl::scripts::equipextension
             for (size_t i = 0; i < subBaseLen; ++i) *p++ = subBase[i];
             *p++ = '\\';
         }
-        for (const char* s = texName; *s; ) *p++ = *s++;
+        for (const char* s = texStem; *s; ) *p++ = *s++;
         if (appendRace || appendGender)
         {
             *p++ = '_';
@@ -691,13 +797,13 @@ namespace wxl::scripts::equipextension
         for (size_t i = 0; i < entries.size(); ++i)
         {
             AttachEntry& e = entries[i];
-            if (e.geoFilter.count == 0) continue;
+            if (!NeedsVirtualModel(e)) continue;
             // Skip if a sibling already processed this (keyBuf, attachId, texBuf) group.
             bool done = false;
             for (size_t j = 0; j < i; ++j)
             {
                 AttachEntry& prev = entries[j];
-                if (prev.geoFilter.count > 0 && SameAttachModelGroup(prev, e)) { done = true; break; }
+                if (NeedsVirtualModel(prev) && SameAttachModelGroup(prev, e)) { done = true; break; }
             }
             if (done) continue;
 
@@ -706,7 +812,7 @@ namespace wxl::scripts::equipextension
             uint16_t mergedIds[16]; uint32_t mergedCount = 0;
             for (auto& e2 : entries)
             {
-                if (e2.geoFilter.count == 0 || !SameAttachModelGroup(e2, e)) continue;
+                if (!SameAttachModelGroup(e2, e)) continue;
                 for (uint32_t fi = 0; fi < e2.geoFilter.count && mergedCount < 16; ++fi)
                 {
                     bool dup = false;
@@ -726,7 +832,7 @@ namespace wxl::scripts::equipextension
             // Propagate the mangled key to all entries in this (keyBuf, attachId, texBuf) group.
             for (auto& e2 : entries)
             {
-                if (e2.geoFilter.count > 0 && SameAttachModelGroup(e2, e))
+                if (NeedsVirtualModel(e2) && SameAttachModelGroup(e2, e))
                     std::memcpy(e2.mangledKeyBuf, mangled, sizeof(e2.mangledKeyBuf));
             }
         }
@@ -749,8 +855,7 @@ namespace wxl::scripts::equipextension
             AttachEntry& e = entries[i];
             if (e.renderCtx) continue;  // already set by a sibling
 
-            const char* p1Key = (e.geoFilter.count > 0 && e.mangledKeyBuf[0])
-                                 ? e.mangledKeyBuf : e.keyBuf;
+            const char* p1Key = e.mangledKeyBuf[0] ? e.mangledKeyBuf : e.keyBuf;
             void* rctx = SafeGetRenderCtx(owner28, p1Key);
             EquipLog("  Phase1 GetRenderCtx key='%s' -> 0x%p", p1Key, rctx);
             if (!rctx) continue;
@@ -798,7 +903,7 @@ namespace wxl::scripts::equipextension
                 //   (b) Non-collection entry whose Phase1 GetRenderCtx failed: skip.
                 // Loading collection entries are NOT nulled by Phase 2.5; they reach here with a
                 // non-null renderCtx (Phase1's rctx) and fall through to the attach below.
-                if (e.geoFilter.count == 0) continue;
+                if (!NeedsVirtualModel(e)) continue;
                 const char* p3Key = e.mangledKeyBuf[0] ? e.mangledKeyBuf : e.keyBuf;
                 void* rctx = SafeGetRenderCtx(owner28, p3Key);
                 EquipLog("  Phase3[%zu] collection re-acquire key='%s' -> 0x%p", i, p3Key, rctx);
@@ -807,7 +912,7 @@ namespace wxl::scripts::equipextension
                 for (size_t j = i + 1; j < entries.size(); ++j)
                 {
                     AttachEntry& e2 = entries[j];
-                    if (!e2.renderCtx && e2.geoFilter.count > 0 && SameAttachModelGroup(e2, e))
+                    if (!e2.renderCtx && NeedsVirtualModel(e2) && SameAttachModelGroup(e2, e))
                         e2.renderCtx = rctx;
                 }
             }
@@ -828,7 +933,15 @@ namespace wxl::scripts::equipextension
             if (e.texBuf[0])
             {
                 void* tex = gm2::LoadResource(e.texBuf, 0);
-                if (tex)
+                if (!tex)
+                {
+                    EquipLog("  Phase3[%zu] texture load failed '%s', skip attach", i, e.texBuf);
+                    for (auto& e2 : entries)
+                        if (SameAttachModelGroup(e2, e)) e2.renderCtx = nullptr;
+                    gm2::ReleaseRenderCtx(rctx);
+                    continue;
+                }
+                else
                 {
                     gm2::BindTexSlot(rctx, tex);
                     // Do not release here. TextureCreate returns a handle that the render context
@@ -1088,6 +1201,13 @@ namespace wxl::scripts::equipextension
                 }
 
                 const bool isCollection = geo.count > 0;
+                if (!isCollection && !SlotAllowsNormalObjectModel(a.modelSlot))
+                {
+                    EquipLog("  %s[%u]: normal model '%s' ignored for texture-only slot %u",
+                             label, idx, stem, a.modelSlot);
+                    continue;
+                }
+
                 const uint32_t ef = effectiveFlags(isCollection);
                 uint32_t attach = attachForEntry(isCollection, mixedCollectionRow, columnAttach,
                                                  defaultAttach, explicitAttach);
@@ -1237,15 +1357,22 @@ namespace wxl::scripts::equipextension
                     {
                         // SafeGetRenderCtx guards against dangling hash-table buckets (same
                         // root cause as the RebuildAllModels equip crash — see that function).
-                        const char* pfKey = (entry.geoFilter.count > 0 && entry.mangledKeyBuf[0])
-                                             ? entry.mangledKeyBuf : entry.keyBuf;
+                        const char* pfKey = entry.mangledKeyBuf[0] ? entry.mangledKeyBuf : entry.keyBuf;
                         void* rctx = SafeGetRenderCtx(owner28, pfKey);
                         if (rctx)
                         {
                             if (entry.texBuf[0])
                             {
                                 void* tex = gm2::LoadResource(entry.texBuf, 0);
-                                if (tex)
+                                if (!tex)
+                                {
+                                    EquipLog("  PerFrame reattach texture load failed '%s', skip", entry.texBuf);
+                                    for (auto& e2 : entries)
+                                        if (e2.renderCtx == renderCtx) e2.renderCtx = nullptr;
+                                    gm2::ReleaseRenderCtx(rctx);
+                                    continue;
+                                }
+                                else
                                 {
                                     gm2::BindTexSlot(rctx, tex);
                                     // Keep the texture handle alive for the attached render context.

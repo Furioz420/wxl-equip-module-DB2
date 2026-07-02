@@ -25,6 +25,7 @@
 #include "runtime/storage/StorageHook.hpp"
 #include "game/io/Io.hpp"
 #include "offsets/engine/Io.hpp"
+#include "structure/m2/M2Format.hpp"
 
 #include <cstdarg>
 #include <cstdint>
@@ -221,6 +222,100 @@ namespace wxl::scripts::equipextension
                  | (static_cast<uint32_t>(bytes[off + 3]) << 24);
         }
 
+        static void WriteU32(std::vector<uint8_t>& bytes, size_t off, uint32_t value) noexcept
+        {
+            bytes[off + 0] = static_cast<uint8_t>(value);
+            bytes[off + 1] = static_cast<uint8_t>(value >> 8);
+            bytes[off + 2] = static_cast<uint8_t>(value >> 16);
+            bytes[off + 3] = static_cast<uint8_t>(value >> 24);
+        }
+
+        static void PatchReplaceableTextureTypes(std::vector<uint8_t>& modelBytes,
+                                                 const char* texPath) noexcept
+        {
+            namespace fmt = wxl::structure::m2;
+
+            if (modelBytes.size() < sizeof(fmt::M2Header)) return;
+            if (ReadU32(modelBytes, 0x00) != fmt::kMagicMD20) return;
+
+            const uint32_t texCount = ReadU32(modelBytes, 0x50);
+            const uint32_t texOfs   = ReadU32(modelBytes, 0x54);
+            constexpr uint32_t kTexStride = sizeof(fmt::M2Texture);
+            if (texOfs > modelBytes.size()) return;
+            if (texCount > (modelBytes.size() - texOfs) / kTexStride) return;
+
+            const bool hasTexPath = texPath && *texPath;
+            uint32_t patchedWeaponBlade = 0;
+            uint32_t patchedObjectSkin = 0;
+            for (uint32_t i = 0; i < texCount; ++i)
+            {
+                const size_t rec = static_cast<size_t>(texOfs) + static_cast<size_t>(i) * kTexStride;
+                const uint32_t texType = ReadU32(modelBytes, rec + 0x00);
+                if (texType == fmt::kTexTypeWeaponBlade)
+                {
+                    WriteU32(modelBytes, rec + 0x00, hasTexPath ? fmt::kTexTypeHardcoded : fmt::kTexTypeObjectSkin);
+                    ++patchedWeaponBlade;
+                    continue;
+                }
+
+                if (hasTexPath && texType == fmt::kTexTypeObjectSkin)
+                {
+                    WriteU32(modelBytes, rec + 0x00, fmt::kTexTypeHardcoded);
+                    ++patchedObjectSkin;
+                }
+            }
+
+            if (patchedWeaponBlade || patchedObjectSkin)
+            {
+                if (hasTexPath)
+                    VPathLog("  VPathPopulate: promoted replaceable texture types weaponBlade=%u objectSkin=%u -> HARDCODED",
+                             patchedWeaponBlade, patchedObjectSkin);
+                else
+                    VPathLog("  VPathPopulate: patched WEAPON_BLADE texture types=%u -> OBJECT_SKIN",
+                             patchedWeaponBlade);
+            }
+        }
+
+        static void PatchHardcodedModelTextures(std::vector<uint8_t>& modelBytes,
+                                                const char* texPath) noexcept
+        {
+            namespace fmt = wxl::structure::m2;
+            if (!texPath || !*texPath || modelBytes.size() < sizeof(fmt::M2Header)) return;
+            if (ReadU32(modelBytes, 0x00) != fmt::kMagicMD20) return;
+
+            const uint32_t texCount = ReadU32(modelBytes, 0x50);
+            const uint32_t texOfs   = ReadU32(modelBytes, 0x54);
+            constexpr uint32_t kTexStride = sizeof(fmt::M2Texture);
+            if (texOfs > modelBytes.size()) return;
+            if (texCount > (modelBytes.size() - texOfs) / kTexStride) return;
+
+            uint32_t patchable = 0;
+            for (uint32_t i = 0; i < texCount; ++i)
+            {
+                const size_t rec = static_cast<size_t>(texOfs) + static_cast<size_t>(i) * kTexStride;
+                if (ReadU32(modelBytes, rec + 0x00) != fmt::kTexTypeHardcoded) continue;
+                ++patchable;
+            }
+            if (!patchable) return;
+
+            const size_t texLen = std::strlen(texPath);
+            if (modelBytes.size() + texLen + 1 > 0xffffffffu) return;
+
+            const uint32_t pathOfs = static_cast<uint32_t>(modelBytes.size());
+            modelBytes.insert(modelBytes.end(), texPath, texPath + texLen);
+            modelBytes.push_back(0);
+
+            for (uint32_t i = 0; i < texCount; ++i)
+            {
+                const size_t rec = static_cast<size_t>(texOfs) + static_cast<size_t>(i) * kTexStride;
+                if (ReadU32(modelBytes, rec + 0x00) != fmt::kTexTypeHardcoded) continue;
+                WriteU32(modelBytes, rec + 0x08, static_cast<uint32_t>(texLen + 1));
+                WriteU32(modelBytes, rec + 0x0C, pathOfs);
+            }
+
+            VPathLog("  VPathPopulate: patched hardcoded textures=%u tex='%s'", patchable, texPath);
+        }
+
         static bool ContainsId(const uint16_t* ids, uint32_t count, uint16_t value) noexcept
         {
             for (uint32_t i = 0; i < count; ++i)
@@ -354,6 +449,8 @@ namespace wxl::scripts::equipextension
             return;
         }
         VPathLog("  VPathPopulate: mdx '%s' -> %zu bytes", normPath, mdxBytes.size());
+        PatchReplaceableTextureTypes(mdxBytes, texPath);
+        PatchHardcodedModelTextures(mdxBytes, texPath);
 
         // Read real 00.skin bytes.
         char rSkin[264];
