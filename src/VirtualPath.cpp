@@ -98,13 +98,26 @@ namespace wxl::scripts::equipextension
             return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
         }
 
+        static uint32_t HashCString(const char* s) noexcept
+        {
+            uint32_t h = 2166136261u;
+            if (!s) return h;
+            while (*s)
+            {
+                h ^= static_cast<uint8_t>(LowerAscii(*s++));
+                h *= 16777619u;
+            }
+            return h;
+        }
+
         // Builds the virtual .m2 key (sortedIds must already be sorted ascending).
-        // Format: <stem>_wxl_<id0>_<id1>..._tex_<texbasename>[_grp<hex>]_cmo<hex>.m2  (all lowercase)
+        // Format: <stem>_wxl_<id0>_<id1>..._tex_<texbasename>[_mat<hash>][_grp<hex>]_cmo<hex>.m2  (all lowercase)
         // The engine normalises all paths to lowercase and uses .m2; keys must match that form.
         static size_t BuildKey(char* out, size_t outSz, void* cmo,
                                 const char* realMdxPath,
                                 const uint16_t* sortedIds, uint32_t idCount,
                                 const char* texPath,
+                                const char* materialPatchSpec,
                                 uint32_t variantKey) noexcept
         {
             if (!out || outSz == 0) return 0;
@@ -139,6 +152,12 @@ namespace wxl::scripts::equipextension
 
                 for (const char* s = "_tex_"; *s && q < end; ) *q++ = *s++;
                 for (const char* p = base; p < baseEnd && q < end; ) *q++ = LowerAscii(*p++);
+            }
+
+            if (materialPatchSpec && *materialPatchSpec)
+            {
+                for (const char* s = "_mat"; *s && q < end; ) *q++ = *s++;
+                q = WriteHex(q, end, HashCString(materialPatchSpec));
             }
 
             if (variantKey != 0)
@@ -228,6 +247,370 @@ namespace wxl::scripts::equipextension
             bytes[off + 1] = static_cast<uint8_t>(value >> 8);
             bytes[off + 2] = static_cast<uint8_t>(value >> 16);
             bytes[off + 3] = static_cast<uint8_t>(value >> 24);
+        }
+
+        static void WriteLeU16(std::vector<uint8_t>& bytes, size_t off, uint16_t value) noexcept
+        {
+            bytes[off + 0] = static_cast<uint8_t>(value);
+            bytes[off + 1] = static_cast<uint8_t>(value >> 8);
+        }
+
+        static void Align4(std::vector<uint8_t>& bytes)
+        {
+            while (bytes.size() & 3u) bytes.push_back(0);
+        }
+
+        static uint32_t ParseU32Span(const char* begin, const char* end, uint32_t fallback) noexcept
+        {
+            if (!begin || !end || begin >= end) return fallback;
+            const char* p = begin;
+            while (p < end && (*p == ' ' || *p == '\t')) ++p;
+            if (p >= end || *p < '0' || *p > '9') return fallback;
+            uint32_t value = 0;
+            while (p < end && *p >= '0' && *p <= '9')
+                value = value * 10u + static_cast<uint32_t>(*p++ - '0');
+            return value;
+        }
+
+        struct MaterialPatch
+        {
+            uint32_t layer = 0xffffffffu;
+            uint32_t textureType = 0xffffffffu;
+            uint16_t batches[64] = {};
+            uint16_t sections[64] = {};
+            uint32_t batchCount = 0;
+            uint32_t sectionCount = 0;
+            bool hide = false;
+            bool hideEdgeFade = false;
+            const char* path = nullptr;
+            size_t pathLen = 0;
+        };
+
+        static bool StartsWithCI(const char* s, size_t len, const char* prefix) noexcept
+        {
+            if (!s || !prefix) return false;
+            size_t i = 0;
+            while (prefix[i])
+            {
+                if (i >= len) return false;
+                char a = s[i];
+                char b = prefix[i];
+                if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+                if (b >= 'A' && b <= 'Z') b = static_cast<char>(b - 'A' + 'a');
+                if (a != b) return false;
+                ++i;
+            }
+            return true;
+        }
+
+        static bool IsHidePath(const char* path, size_t pathLen) noexcept
+        {
+            return StartsWithCI(path, pathLen, "__hide__") ||
+                   StartsWithCI(path, pathLen, "hide");
+        }
+
+        static void ParseNumberList(const char* begin, const char* end,
+                                    uint16_t* out, uint32_t* count, uint32_t maxCount) noexcept
+        {
+            if (!out || !count || !begin || !end) return;
+            const char* p = begin;
+            while (p < end && *count < maxCount)
+            {
+                while (p < end && (*p < '0' || *p > '9')) ++p;
+                if (p >= end) break;
+                uint32_t value = 0;
+                while (p < end && *p >= '0' && *p <= '9')
+                    value = value * 10u + static_cast<uint32_t>(*p++ - '0');
+                if (value <= 0xffffu)
+                    out[(*count)++] = static_cast<uint16_t>(value);
+            }
+        }
+
+        static uint32_t ParseMaterialPatchSpec(const char* spec,
+                                               MaterialPatch* out,
+                                               uint32_t outCount) noexcept
+        {
+            if (!spec || !*spec || !out || outCount == 0) return 0;
+
+            uint32_t count = 0;
+            const char* part = spec;
+            while (*part && count < outCount)
+            {
+                const char* end = part;
+                while (*end && *end != '|') ++end;
+
+                const char* c1 = part;
+                while (c1 < end && *c1 != ':') ++c1;
+                const char* c2 = c1 < end ? c1 + 1 : end;
+                while (c2 < end && *c2 != ':') ++c2;
+                const char* c3 = c2 < end ? c2 + 1 : end;
+                while (c3 < end && *c3 != ':') ++c3;
+                const char* eq = c3 < end ? c3 + 1 : end;
+                while (eq < end && *eq != '=') ++eq;
+
+                if (c1 < end && c2 < end && c3 < end && eq < end)
+                {
+                    MaterialPatch p = {};
+                    p.layer = ParseU32Span(part, c1, 0xffffffffu);
+                    p.textureType = ParseU32Span(c1 + 1, c2, 0xffffffffu);
+                    ParseNumberList(c2 + 1, c3, p.batches, &p.batchCount, 64);
+                    ParseNumberList(c3 + 1, eq, p.sections, &p.sectionCount, 64);
+                    p.path = eq + 1;
+                    while (p.path < end && (*p.path == ' ' || *p.path == '\t')) ++p.path;
+                    const char* pathEnd = end;
+                    while (pathEnd > p.path && (pathEnd[-1] == ' ' || pathEnd[-1] == '\t')) --pathEnd;
+                    p.pathLen = static_cast<size_t>(pathEnd - p.path);
+                    p.hideEdgeFade = StartsWithCI(p.path, p.pathLen, "__hide__edgefade");
+                    p.hide = p.hideEdgeFade || IsHidePath(p.path, p.pathLen);
+                    if (p.layer != 0xffffffffu && p.pathLen > 0 &&
+                        (p.hideEdgeFade || p.batchCount > 0 || p.sectionCount > 0))
+                    {
+                        out[count++] = p;
+                    }
+                }
+
+                if (!*end) break;
+                part = end + 1;
+            }
+            return count;
+        }
+
+        static bool ContainsU16(const uint16_t* values, uint32_t count, uint16_t value) noexcept
+        {
+            for (uint32_t i = 0; i < count; ++i)
+                if (values[i] == value) return true;
+            return false;
+        }
+
+        static bool ReadTextureCombos(const std::vector<uint8_t>& modelBytes,
+                                      std::vector<uint16_t>& out) noexcept
+        {
+            namespace fmt = wxl::structure::m2;
+            if (modelBytes.size() < sizeof(fmt::M2Header)) return false;
+            if (ReadU32(modelBytes, 0x00) != fmt::kMagicMD20) return false;
+
+            const uint32_t comboCount = ReadU32(modelBytes, 0x80);
+            const uint32_t comboOfs = ReadU32(modelBytes, 0x84);
+            if (comboCount == 0) return false;
+            if (comboOfs > modelBytes.size()) return false;
+            if (comboCount > (modelBytes.size() - comboOfs) / sizeof(uint16_t)) return false;
+
+            out.resize(comboCount);
+            for (uint32_t i = 0; i < comboCount; ++i)
+                out[i] = ReadU16(modelBytes, comboOfs + i * sizeof(uint16_t));
+            return true;
+        }
+
+        static bool WriteTextureCombos(std::vector<uint8_t>& modelBytes,
+                                       const std::vector<uint16_t>& combos) noexcept
+        {
+            if (combos.empty() || combos.size() > 0xffffffffu) return false;
+            Align4(modelBytes);
+            const uint32_t ofs = static_cast<uint32_t>(modelBytes.size());
+            const size_t bytes = combos.size() * sizeof(uint16_t);
+            modelBytes.resize(modelBytes.size() + bytes);
+            for (size_t i = 0; i < combos.size(); ++i)
+                WriteLeU16(modelBytes, ofs + i * sizeof(uint16_t), combos[i]);
+            WriteU32(modelBytes, 0x80, static_cast<uint32_t>(combos.size()));
+            WriteU32(modelBytes, 0x84, ofs);
+            return true;
+        }
+
+        static uint32_t AppendHardcodedTexture(std::vector<uint8_t>& modelBytes,
+                                               const char* path,
+                                               size_t pathLen) noexcept
+        {
+            namespace fmt = wxl::structure::m2;
+            if (!path || pathLen == 0 || modelBytes.size() < sizeof(fmt::M2Header)) return 0xffffffffu;
+            if (ReadU32(modelBytes, 0x00) != fmt::kMagicMD20) return 0xffffffffu;
+
+            const uint32_t texCount = ReadU32(modelBytes, 0x50);
+            const uint32_t texOfs = ReadU32(modelBytes, 0x54);
+            constexpr uint32_t kTexStride = sizeof(fmt::M2Texture);
+            if (texOfs > modelBytes.size()) return 0xffffffffu;
+            if (texCount > (modelBytes.size() - texOfs) / kTexStride) return 0xffffffffu;
+            if (texCount >= 0xffffu) return 0xffffffffu;
+
+            Align4(modelBytes);
+            const uint32_t pathOfs = static_cast<uint32_t>(modelBytes.size());
+            modelBytes.insert(modelBytes.end(), path, path + pathLen);
+            modelBytes.push_back(0);
+
+            Align4(modelBytes);
+            const uint32_t newTexOfs = static_cast<uint32_t>(modelBytes.size());
+            std::vector<uint8_t> oldTextures(modelBytes.begin() + texOfs,
+                                             modelBytes.begin() + texOfs + texCount * kTexStride);
+            modelBytes.insert(modelBytes.end(), oldTextures.begin(), oldTextures.end());
+            const size_t rec = modelBytes.size();
+            modelBytes.resize(modelBytes.size() + kTexStride);
+            WriteU32(modelBytes, rec + 0x00, fmt::kTexTypeHardcoded);
+            WriteU32(modelBytes, rec + 0x04, 0);
+            WriteU32(modelBytes, rec + 0x08, static_cast<uint32_t>(pathLen + 1));
+            WriteU32(modelBytes, rec + 0x0C, pathOfs);
+
+            WriteU32(modelBytes, 0x50, texCount + 1);
+            WriteU32(modelBytes, 0x54, newTexOfs);
+            return texCount;
+        }
+
+        static bool BatchMatchesPatch(const MaterialPatch& patch,
+                                      const std::vector<uint8_t>& skinBytes,
+                                      uint32_t batchIndex,
+                                      size_t batchOfs,
+                                      uint32_t submeshCount,
+                                      uint32_t submeshOfs) noexcept
+        {
+            if (ContainsU16(patch.batches, patch.batchCount, static_cast<uint16_t>(batchIndex)))
+                return true;
+
+            if (patch.sectionCount == 0) return false;
+            const uint16_t skinSectionIndex = ReadU16(skinBytes, batchOfs + 0x04);
+            if (skinSectionIndex >= submeshCount) return false;
+            const size_t sub = submeshOfs + static_cast<size_t>(skinSectionIndex) * 0x30;
+            if (sub + 0x30 > skinBytes.size()) return false;
+            const uint16_t sectionId = ReadU16(skinBytes, sub + 0x00);
+            return ContainsU16(patch.sections, patch.sectionCount, sectionId);
+        }
+
+        static bool BatchLooksLikeEdgeFade(const std::vector<uint8_t>& skinBytes,
+                                           size_t batchOfs) noexcept
+        {
+            if (batchOfs + sizeof(wxl::structure::m2::M2Batch) > skinBytes.size()) return false;
+            const uint8_t flags = skinBytes[batchOfs + 0x00];
+            const uint16_t shaderId = ReadU16(skinBytes, batchOfs + 0x02);
+            return (flags & 0x80) != 0 && (shaderId == 0x4011 || shaderId == 0x8015);
+        }
+
+        static uint32_t RemoveHiddenBatches(std::vector<uint8_t>& skinBytes,
+                                            const std::vector<uint8_t>& hidden,
+                                            uint32_t batchCount,
+                                            uint32_t batchOfs) noexcept
+        {
+            if (hidden.empty() || batchCount == 0) return 0;
+            constexpr uint32_t kBatchStride = sizeof(wxl::structure::m2::M2Batch);
+
+            std::vector<uint8_t> kept;
+            kept.reserve(static_cast<size_t>(batchCount) * kBatchStride);
+            uint32_t removed = 0;
+            for (uint32_t bi = 0; bi < batchCount; ++bi)
+            {
+                const size_t b = batchOfs + static_cast<size_t>(bi) * kBatchStride;
+                if (bi < hidden.size() && hidden[bi])
+                {
+                    ++removed;
+                    continue;
+                }
+                kept.insert(kept.end(), skinBytes.begin() + b, skinBytes.begin() + b + kBatchStride);
+            }
+            if (removed == 0 || kept.empty()) return 0;
+
+            Align4(skinBytes);
+            const uint32_t newOfs = static_cast<uint32_t>(skinBytes.size());
+            skinBytes.insert(skinBytes.end(), kept.begin(), kept.end());
+            WriteU32(skinBytes, 0x24, static_cast<uint32_t>(kept.size() / kBatchStride));
+            WriteU32(skinBytes, 0x28, newOfs);
+            return removed;
+        }
+
+        static void PatchTargetedMaterialTextures(std::vector<uint8_t>& modelBytes,
+                                                  std::vector<uint8_t>& skinBytes,
+                                                  const char* materialPatchSpec) noexcept
+        {
+            if (!materialPatchSpec || !*materialPatchSpec) return;
+            if (skinBytes.size() < 0x2C || std::memcmp(skinBytes.data(), "SKIN", 4) != 0) return;
+
+            MaterialPatch patches[16];
+            const uint32_t patchCount = ParseMaterialPatchSpec(materialPatchSpec, patches, 16);
+            if (!patchCount) return;
+
+            const uint32_t submeshCount = ReadU32(skinBytes, 0x1C);
+            const uint32_t submeshOfs = ReadU32(skinBytes, 0x20);
+            const uint32_t batchCount = ReadU32(skinBytes, 0x24);
+            const uint32_t batchOfs = ReadU32(skinBytes, 0x28);
+            if (submeshOfs > skinBytes.size() || batchOfs > skinBytes.size()) return;
+            if (submeshCount > (skinBytes.size() - submeshOfs) / 0x30) return;
+            if (batchCount > (skinBytes.size() - batchOfs) / sizeof(wxl::structure::m2::M2Batch)) return;
+
+            std::vector<uint8_t> hiddenBatches(batchCount, 0);
+            uint32_t markedHidden = 0;
+            bool hasTexturePatches = false;
+            for (uint32_t pi = 0; pi < patchCount; ++pi)
+            {
+                if (!patches[pi].hide)
+                {
+                    hasTexturePatches = true;
+                    continue;
+                }
+                for (uint32_t bi = 0; bi < batchCount; ++bi)
+                {
+                    const size_t b = batchOfs + static_cast<size_t>(bi) * sizeof(wxl::structure::m2::M2Batch);
+                    const bool match = patches[pi].hideEdgeFade
+                        ? BatchLooksLikeEdgeFade(skinBytes, b)
+                        : BatchMatchesPatch(patches[pi], skinBytes, bi, b, submeshCount, submeshOfs);
+                    if (!match)
+                        continue;
+                    if (!hiddenBatches[bi])
+                    {
+                        hiddenBatches[bi] = 1;
+                        ++markedHidden;
+                    }
+                }
+            }
+
+            std::vector<uint16_t> combos;
+            if (hasTexturePatches && !ReadTextureCombos(modelBytes, combos))
+            {
+                VPathLog("  VPathPopulate: material texture patch skipped, no textureCombos spec='%s'",
+                         materialPatchSpec);
+                hasTexturePatches = false;
+            }
+
+            uint32_t patchedBatches = 0;
+            uint32_t appendedTextures = 0;
+            const size_t originalComboCount = combos.size();
+            constexpr uint32_t kBatchStride = sizeof(wxl::structure::m2::M2Batch);
+            for (uint32_t pi = 0; pi < patchCount; ++pi)
+            {
+                if (!hasTexturePatches) break;
+                if (patches[pi].hide) continue;
+                const uint32_t newTexIndex = AppendHardcodedTexture(modelBytes, patches[pi].path, patches[pi].pathLen);
+                if (newTexIndex == 0xffffffffu) continue;
+                ++appendedTextures;
+
+                for (uint32_t bi = 0; bi < batchCount; ++bi)
+                {
+                    const size_t b = batchOfs + static_cast<size_t>(bi) * kBatchStride;
+                    if (bi < hiddenBatches.size() && hiddenBatches[bi]) continue;
+                    if (!BatchMatchesPatch(patches[pi], skinBytes, bi, b, submeshCount, submeshOfs))
+                        continue;
+
+                    const uint16_t textureCount = ReadU16(skinBytes, b + 0x0E);
+                    const uint16_t comboIndex = ReadU16(skinBytes, b + 0x10);
+                    if (textureCount == 0 || patches[pi].layer >= textureCount) continue;
+                    if (static_cast<uint32_t>(comboIndex) + textureCount > combos.size()) continue;
+                    if (combos.size() + textureCount > 0xffffu) continue;
+
+                    const uint16_t newComboIndex = static_cast<uint16_t>(combos.size());
+                    for (uint32_t ti = 0; ti < textureCount; ++ti)
+                        combos.push_back(combos[comboIndex + ti]);
+                    combos[newComboIndex + patches[pi].layer] = static_cast<uint16_t>(newTexIndex);
+                    WriteLeU16(skinBytes, b + 0x10, newComboIndex);
+                    ++patchedBatches;
+                }
+            }
+
+            if (combos.size() != originalComboCount && WriteTextureCombos(modelBytes, combos))
+            {
+                VPathLog("  VPathPopulate: material patch textures=%u batches=%u combos=%zu spec='%s'",
+                         appendedTextures, patchedBatches, combos.size(), materialPatchSpec);
+            }
+
+            const uint32_t removed = RemoveHiddenBatches(skinBytes, hiddenBatches, batchCount, batchOfs);
+            if (removed || markedHidden)
+            {
+                VPathLog("  VPathPopulate: material hide marked=%u removed=%u spec='%s'",
+                         markedHidden, removed, materialPatchSpec);
+            }
         }
 
         static void PatchReplaceableTextureTypes(std::vector<uint8_t>& modelBytes,
@@ -344,16 +727,25 @@ namespace wxl::scripts::equipextension
             {
                 const size_t sub = submeshOfs + si * 0x30;
                 const uint16_t sectionId = ReadU16(skinBytes, sub + 0x00);
+                const uint16_t level = ReadU16(skinBytes, sub + 0x02);
                 const uint16_t indexStart = ReadU16(skinBytes, sub + 0x08);
                 const uint16_t indexCount = ReadU16(skinBytes, sub + 0x0A);
-                if (indexCount == 0 || indexStart + indexCount > rawIndexCount) continue;
-                if (sectionId == 0 || ContainsId(geoIds, geoCount, sectionId))
+                if (indexCount == 0) continue;
+
+                uint32_t fullIndexStart = (static_cast<uint32_t>(level) << 16) | indexStart;
+                if (fullIndexStart > rawIndexCount || indexCount > rawIndexCount - fullIndexStart)
+                {
+                    fullIndexStart = indexStart;
+                    if (fullIndexStart > rawIndexCount || indexCount > rawIndexCount - fullIndexStart) continue;
+                }
+
+                if (ContainsId(geoIds, geoCount, sectionId))
                 {
                     ++kept;
                     continue;
                 }
 
-                std::memset(skinBytes.data() + rawIndexOfs + indexStart * sizeof(uint16_t),
+                std::memset(skinBytes.data() + rawIndexOfs + fullIndexStart * sizeof(uint16_t),
                             0,
                             indexCount * sizeof(uint16_t));
                 ++zeroed;
@@ -406,19 +798,22 @@ namespace wxl::scripts::equipextension
                          const char* realMdxPath,
                          const uint16_t* geoIds, uint32_t geoCount,
                          const char* texPath,
-                         uint32_t variantKey)
+                         uint32_t variantKey,
+                         const char* materialPatchSpec)
     {
         uint16_t sorted[16];
         uint32_t n = geoCount < 16 ? geoCount : 16;
         for (uint32_t i = 0; i < n; ++i) sorted[i] = geoIds[i];
         SortIds(sorted, n);
-        return BuildKey(out, outSz, cmo, realMdxPath, sorted, n, texPath, variantKey);
+        return BuildKey(out, outSz, cmo, realMdxPath, sorted, n, texPath,
+                        materialPatchSpec, variantKey);
     }
 
-    void VPathPopulate(void* cmo, const char* realMdxPath,
+    bool VPathPopulate(void* cmo, const char* realMdxPath,
                        const uint16_t* geoIds, uint32_t geoCount,
                        const char* texPath,
-                       uint32_t variantKey)
+                       uint32_t variantKey,
+                       const char* materialPatchSpec)
     {
         uint16_t sorted[16];
         uint32_t n = geoCount < 16 ? geoCount : 16;
@@ -427,10 +822,11 @@ namespace wxl::scripts::equipextension
 
         // Build virtual .mdx key.
         char vMdx[264];
-        if (!BuildKey(vMdx, sizeof(vMdx), cmo, realMdxPath, sorted, n, texPath, variantKey)) return;
+        if (!BuildKey(vMdx, sizeof(vMdx), cmo, realMdxPath, sorted, n, texPath,
+                      materialPatchSpec, variantKey)) return false;
 
         // No-op if already populated (same permutation on a re-equip cycle).
-        if (g_virtualBytes.count(vMdx)) return;
+        if (g_virtualBytes.count(vMdx)) return true;
 
         // Build virtual .skin key.
         char vSkin[264];
@@ -446,7 +842,7 @@ namespace wxl::scripts::equipextension
         if (!ReadGameFile(normPath, mdxBytes))
         {
             VPathLog("  VPathPopulate: mdx READ FAILED '%s'", normPath);
-            return;
+            return false;
         }
         VPathLog("  VPathPopulate: mdx '%s' -> %zu bytes", normPath, mdxBytes.size());
         PatchReplaceableTextureTypes(mdxBytes, texPath);
@@ -459,6 +855,8 @@ namespace wxl::scripts::equipextension
         ReadGameFile(rSkin, skinBytes); // skin may be absent for some models; that is OK
         if (!skinBytes.empty())
             ApplySkinByteFilter(skinBytes, sorted, n);
+        if (!skinBytes.empty())
+            PatchTargetedMaterialTextures(mdxBytes, skinBytes, materialPatchSpec);
         VPathLog("  VPathPopulate: skin '%s' -> %zu bytes", rSkin, skinBytes.size());
         VPathLog("  VPathPopulate: vMdx='%s'", vMdx);
         VPathLog("  VPathPopulate: vSkin='%s'", vSkin);
@@ -472,6 +870,7 @@ namespace wxl::scripts::equipextension
         auto& paths = g_cmoVPaths[cmo];
         paths.emplace_back(vMdx);
         if (g_virtualBytes.count(vSkin)) paths.emplace_back(vSkin);
+        return true;
     }
 
     void VPathEvictCmo(void* cmo)
