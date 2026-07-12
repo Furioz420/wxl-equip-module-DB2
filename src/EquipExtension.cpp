@@ -28,6 +28,7 @@
 
 #include <cstddef>
 #include <cstdio>
+#include <cstdarg>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -109,6 +110,9 @@ namespace wxl::scripts::equipextension
         bool        perFrameLogged    = false; // suppress repeated per-frame noise after first log
         bool        charSweepApplied = false; // set when character-model PerFrame sweep first copies bones
         bool        bbpLogDone       = false; // suppress OnBuildBonePalette remap dump after first fire
+        uint16_t    texAnimProbeFrames = 0; // short targeted UV-animation diagnostic
+        uint32_t    texAnimProbeFirst[4] = {};
+        uint8_t     texAnimProbeChanged = 0;
     };
 
     // ─── File-scope state ─────────────────────────────────────────────────────────
@@ -178,11 +182,28 @@ namespace wxl::scripts::equipextension
 
     // ─── Debug logging ───────────────────────────────────────────────────────────
 
-    // Append a line to WarcraftXL_equip.log in the game directory.
-    // fopen("a") is safe to call from any thread; disk I/O only, no WoW state touched.
-    // Toggle off by deleting or renaming the log file between sessions.
+    static bool EquipLogEnabled() noexcept
+    {
+        static int enabled = []() noexcept -> int {
+#pragma warning(suppress: 4996)
+            const char* env = std::getenv("WXL_EQUIP_LOG");
+            if (env && *env && *env != '0' && *env != 'n' && *env != 'N')
+                return 1;
+
+#pragma warning(suppress: 4996)
+            FILE* flag = std::fopen("WarcraftXL_equip.log.enable", "rb");
+            if (!flag) return 0;
+            std::fclose(flag);
+            return 1;
+        }();
+        return enabled != 0;
+    }
+
+    // Verbose equip diagnostics are opt-in. They touch very hot model/skin/per-frame paths, and opening
+    // + flushing the log for every line can dominate frame time on HD-equipment-heavy scenes.
     static void EquipLog(const char* fmt, ...) noexcept
     {
+        if (!EquipLogEnabled()) return;
 #pragma warning(suppress: 4996)
         FILE* f = std::fopen("WarcraftXL_equip.log", "a");
         if (!f) return;
@@ -221,6 +242,57 @@ namespace wxl::scripts::equipextension
         __try { v = *static_cast<void* const*>(addr); }
         __except (EXCEPTION_EXECUTE_HANDLER) {}
         return v;
+    }
+
+    static uint32_t GuardedMatrixHash(const void* matrix) noexcept
+    {
+        if (!matrix) return 0;
+        uint32_t hash = 2166136261u;
+        __try
+        {
+            const auto* words = static_cast<const uint32_t*>(matrix);
+            for (uint32_t i = 0; i < 16; ++i)
+                hash = (hash ^ words[i]) * 16777619u;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
+        return hash;
+    }
+
+    static void ProbeRaidWarriorTextureAnimation(AttachEntry& entry, void* renderCtx) noexcept
+    {
+        if (entry.texAnimProbeFrames >= 1200 ||
+            !std::strstr(entry.keyBuf, "raidwarriorprogenitor_d_01")) return;
+
+        void* evaluated = GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + 0xAC);
+        void* matrices  = GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + 0xB0);
+        const uint32_t hashes[4] = {
+            GuardedMatrixHash(evaluated),
+            GuardedMatrixHash(evaluated ? reinterpret_cast<uint8_t*>(evaluated) + 0x40 : nullptr),
+            GuardedMatrixHash(matrices),
+            GuardedMatrixHash(matrices ? reinterpret_cast<uint8_t*>(matrices) + 0x40 : nullptr)
+        };
+
+        if (entry.texAnimProbeFrames == 0)
+            std::memcpy(entry.texAnimProbeFirst, hashes, sizeof(hashes));
+        else
+            for (uint32_t i = 0; i < 4; ++i)
+                if (hashes[i] && hashes[i] != entry.texAnimProbeFirst[i])
+                    entry.texAnimProbeChanged |= static_cast<uint8_t>(1u << i);
+
+        ++entry.texAnimProbeFrames;
+        if (entry.texAnimProbeFrames == 1 || entry.texAnimProbeFrames == 30 ||
+            entry.texAnimProbeFrames == 90 || entry.texAnimProbeFrames == 300 ||
+            entry.texAnimProbeFrames == 600 || entry.texAnimProbeFrames == 900 ||
+            entry.texAnimProbeFrames == 1200)
+        {
+            EquipLog("  TexAnimProbe frame=%u key='%s' eval=[%08X %08X] out=[%08X %08X] changed=0x%X",
+                     static_cast<uint32_t>(entry.texAnimProbeFrames), entry.keyBuf,
+                     hashes[0], hashes[1], hashes[2], hashes[3],
+                     static_cast<uint32_t>(entry.texAnimProbeChanged));
+        }
     }
 
     static bool CopyRemappedBonesGuarded(uint8_t* dstBuf,
@@ -2144,6 +2216,8 @@ namespace wxl::scripts::equipextension
                     }
                     return;
                 }
+
+                ProbeRaidWarriorTextureAnimation(entry, renderCtx);
 
                 // Bone matrix copy via 3-pass remap table.
                 // charCtx is the character's render_ctx (= cmo->sceneNode = the outer frame call).

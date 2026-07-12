@@ -30,6 +30,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -39,8 +40,26 @@ namespace wxl::scripts::equipextension
 {
     namespace
     {
+        static bool EquipLogEnabled() noexcept
+        {
+            static int enabled = []() noexcept -> int {
+#pragma warning(suppress: 4996)
+                const char* env = std::getenv("WXL_EQUIP_LOG");
+                if (env && *env && *env != '0' && *env != 'n' && *env != 'N')
+                    return 1;
+
+#pragma warning(suppress: 4996)
+                FILE* flag = std::fopen("WarcraftXL_equip.log.enable", "rb");
+                if (!flag) return 0;
+                std::fclose(flag);
+                return 1;
+            }();
+            return enabled != 0;
+        }
+
         static void VPathLog(const char* fmt, ...) noexcept
         {
+            if (!EquipLogEnabled()) return;
 #pragma warning(suppress: 4996)
             FILE* f = std::fopen("WarcraftXL_equip.log", "a");
             if (!f) return;
