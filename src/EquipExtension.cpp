@@ -18,7 +18,9 @@
 #include "VirtualPath.hpp"
 #include "events/Event.hpp"
 #include "game/Binding.hpp"
+#include "game/io/Io.hpp"
 #include "game/m2/M2.hpp"
+#include "offsets/engine/Io.hpp"
 #include "offsets/game/DB2.hpp"
 #include "offsets/game/M2.hpp"
 
@@ -26,8 +28,11 @@
 
 #include <cstddef>
 #include <cstdio>
+#include <cstdarg>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -60,6 +65,34 @@ namespace wxl::scripts::equipextension
         uint8_t  collToChar[256];
     };
 
+    struct SidecarModelEntry
+    {
+        uint32_t modelSlot    = static_cast<uint32_t>(-1);
+        uint32_t attachId     = static_cast<uint32_t>(-1);
+        uint32_t modelFlags   = 0x2 | 0x4; // exact path unless the sidecar asks for race/gender suffixes
+        uint32_t textureFlags = 0;
+        char     folder[32]   = {};
+        char     model[264]   = {};
+        char     texture[264] = {};
+        GeosetFilter geoFilter = {};
+    };
+
+    struct SidecarMaterialEntry
+    {
+        uint32_t modelIndex  = static_cast<uint32_t>(-1);
+        uint32_t modelColumn = static_cast<uint32_t>(-1);
+        uint32_t layer       = static_cast<uint32_t>(-1);
+        uint32_t textureType = static_cast<uint32_t>(-1);
+        char     folder[32]  = {};
+        char     model[264]  = {};
+        char     texture[264] = {};
+        char     skinSectionIds[256] = {};
+        char     batchIndexes[256] = {};
+        char     targetSkinSectionIds[256] = {};
+        char     targetBatchIndexes[256] = {};
+        char     targetMode[32] = {};
+    };
+
     // One attachment entry per attached M2. Keyed by CharModelObject pointer in g_attached.
     struct AttachEntry
     {
@@ -70,17 +103,26 @@ namespace wxl::scripts::equipextension
         char        keyBuf[264] = {};        // real M2 path (used for matching/dedup)
         char        mangledKeyBuf[264] = {}; // virtual _wxl_ path for GetRenderCtx (collection only)
         char        texBuf[264] = {};    // BLP path for BindTexSlot on re-attach
+        char        matTexBuf[2048] = {}; // batch-scoped material texture patches for virtual M2 bytes
         GeosetFilter geoFilter  = {};
         BoneRemap    boneRemap  = {};
+        uint32_t    mergeKey = 0; // non-zero keeps logical semicolon collection models separate
         bool        perFrameLogged    = false; // suppress repeated per-frame noise after first log
         bool        charSweepApplied = false; // set when character-model PerFrame sweep first copies bones
         bool        bbpLogDone       = false; // suppress OnBuildBonePalette remap dump after first fire
+        uint16_t    texAnimProbeFrames = 0; // short targeted UV-animation diagnostic
+        uint32_t    texAnimProbeFirst[4] = {};
+        uint8_t     texAnimProbeChanged = 0;
     };
 
     // ─── File-scope state ─────────────────────────────────────────────────────────
 
     // cmo (CharModelObject*) → attached M2 entries for that character
     static std::unordered_map<void*, std::vector<AttachEntry>> g_attached;
+
+    static bool g_sidecarLoaded = false;
+    static std::unordered_map<uint32_t, std::vector<SidecarModelEntry>> g_sidecarModels;
+    static std::unordered_map<uint32_t, std::vector<SidecarMaterialEntry>> g_sidecarMaterials;
 
     // Set to the cmo being processed in RebuildAllModels Phase1. OnM2SkinFinalize uses
     // this to apply the filter during a synchronous load that fires kFinalizeSkin inside
@@ -112,6 +154,8 @@ namespace wxl::scripts::equipextension
         { "Cape",     12,  12, false, false }, // 9  BACK
         { "Tabard",   34,  34, false, false }, // 10 TABARD
     };
+    constexpr uint32_t kCollectionAttach = 19;
+    constexpr uint32_t kFlagForceModelRaceGender = 0x80;
 
     // WoW C++ equip slot (0-18) → internal model slot. UINT32_MAX = not handled here.
     static const uint32_t kEquipToModelSlot[19] = {
@@ -138,11 +182,28 @@ namespace wxl::scripts::equipextension
 
     // ─── Debug logging ───────────────────────────────────────────────────────────
 
-    // Append a line to WarcraftXL_equip.log in the game directory.
-    // fopen("a") is safe to call from any thread; disk I/O only, no WoW state touched.
-    // Toggle off by deleting or renaming the log file between sessions.
+    static bool EquipLogEnabled() noexcept
+    {
+        static int enabled = []() noexcept -> int {
+#pragma warning(suppress: 4996)
+            const char* env = std::getenv("WXL_EQUIP_LOG");
+            if (env && *env && *env != '0' && *env != 'n' && *env != 'N')
+                return 1;
+
+#pragma warning(suppress: 4996)
+            FILE* flag = std::fopen("WarcraftXL_equip.log.enable", "rb");
+            if (!flag) return 0;
+            std::fclose(flag);
+            return 1;
+        }();
+        return enabled != 0;
+    }
+
+    // Verbose equip diagnostics are opt-in. They touch very hot model/skin/per-frame paths, and opening
+    // + flushing the log for every line can dominate frame time on HD-equipment-heavy scenes.
     static void EquipLog(const char* fmt, ...) noexcept
     {
+        if (!EquipLogEnabled()) return;
 #pragma warning(suppress: 4996)
         FILE* f = std::fopen("WarcraftXL_equip.log", "a");
         if (!f) return;
@@ -151,6 +212,18 @@ namespace wxl::scripts::equipextension
         va_end(ap);
         std::fputc('\n', f);
         std::fclose(f);
+    }
+
+    static bool SameAttachModelGroup(const AttachEntry& a, const AttachEntry& b) noexcept
+    {
+        const bool aFiltered = a.geoFilter.count > 0;
+        const bool bFiltered = b.geoFilter.count > 0;
+        return a.mergeKey == b.mergeKey &&
+               a.attachId == b.attachId &&
+               aFiltered == bFiltered &&
+               std::strcmp(a.keyBuf, b.keyBuf) == 0 &&
+               std::strcmp(a.texBuf, b.texBuf) == 0 &&
+               std::strcmp(a.matTexBuf, b.matTexBuf) == 0;
     }
 
     // ─── SEH helpers (no C++ objects — safe to use __try/__except) ───────────────
@@ -169,6 +242,82 @@ namespace wxl::scripts::equipextension
         __try { v = *static_cast<void* const*>(addr); }
         __except (EXCEPTION_EXECUTE_HANDLER) {}
         return v;
+    }
+
+    static uint32_t GuardedMatrixHash(const void* matrix) noexcept
+    {
+        if (!matrix) return 0;
+        uint32_t hash = 2166136261u;
+        __try
+        {
+            const auto* words = static_cast<const uint32_t*>(matrix);
+            for (uint32_t i = 0; i < 16; ++i)
+                hash = (hash ^ words[i]) * 16777619u;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
+        return hash;
+    }
+
+    static void ProbeRaidWarriorTextureAnimation(AttachEntry& entry, void* renderCtx) noexcept
+    {
+        if (entry.texAnimProbeFrames >= 1200 ||
+            !std::strstr(entry.keyBuf, "raidwarriorprogenitor_d_01")) return;
+
+        void* evaluated = GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + 0xAC);
+        void* matrices  = GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + 0xB0);
+        const uint32_t hashes[4] = {
+            GuardedMatrixHash(evaluated),
+            GuardedMatrixHash(evaluated ? reinterpret_cast<uint8_t*>(evaluated) + 0x40 : nullptr),
+            GuardedMatrixHash(matrices),
+            GuardedMatrixHash(matrices ? reinterpret_cast<uint8_t*>(matrices) + 0x40 : nullptr)
+        };
+
+        if (entry.texAnimProbeFrames == 0)
+            std::memcpy(entry.texAnimProbeFirst, hashes, sizeof(hashes));
+        else
+            for (uint32_t i = 0; i < 4; ++i)
+                if (hashes[i] && hashes[i] != entry.texAnimProbeFirst[i])
+                    entry.texAnimProbeChanged |= static_cast<uint8_t>(1u << i);
+
+        ++entry.texAnimProbeFrames;
+        if (entry.texAnimProbeFrames == 1 || entry.texAnimProbeFrames == 30 ||
+            entry.texAnimProbeFrames == 90 || entry.texAnimProbeFrames == 300 ||
+            entry.texAnimProbeFrames == 600 || entry.texAnimProbeFrames == 900 ||
+            entry.texAnimProbeFrames == 1200)
+        {
+            EquipLog("  TexAnimProbe frame=%u key='%s' eval=[%08X %08X] out=[%08X %08X] changed=0x%X",
+                     static_cast<uint32_t>(entry.texAnimProbeFrames), entry.keyBuf,
+                     hashes[0], hashes[1], hashes[2], hashes[3],
+                     static_cast<uint32_t>(entry.texAnimProbeChanged));
+        }
+    }
+
+    static bool CopyRemappedBonesGuarded(uint8_t* dstBuf,
+                                         const uint8_t* srcBuf,
+                                         const BoneRemap& remap) noexcept
+    {
+        if (!dstBuf || !srcBuf || remap.count == 0 || remap.count > 256)
+            return false;
+
+        __try
+        {
+            for (uint32_t bi = 0; bi < remap.count; ++bi)
+            {
+                uint8_t ci = remap.collToChar[bi];
+                if (ci == 0xFF) continue;
+                std::memcpy(dstBuf + bi * m2::kBonePaletteStride,
+                            srcBuf + ci * m2::kBonePaletteStride,
+                            m2::kBonePaletteStride);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+        return true;
     }
 
     // SEH-only wrapper: no C++ objects in this function, __try is safe.
@@ -302,7 +451,8 @@ namespace wxl::scripts::equipextension
 
     // flags: 0x1=hide geoset, 0x2=no gender, 0x4=no race,
     //        0x8=append race to tex, 0x10=append gender to tex,
-    //        0x20=model in subfolder, 0x40=new _Hu_F suffix
+    //        0x20=model in subfolder, 0x40=new _Hu_F suffix,
+    //        0x80=force model race/gender suffix
 
     static GeosetFilter ParseGeosetFilter(const char* spec)
     {
@@ -318,6 +468,232 @@ namespace wxl::scripts::equipextension
             else break;
         }
         return f;
+    }
+
+    static bool CopyListPart(const char* list, uint32_t index, char* out, size_t outSz)
+    {
+        if (outSz == 0) return false;
+        out[0] = '\0';
+        if (!list) return false;
+
+        const char* part = list;
+        uint32_t cur = 0;
+        for (;;)
+        {
+            const char* end = part;
+            while (*end && *end != ';') ++end;
+
+            if (cur == index)
+            {
+                while (part < end && (*part == ' ' || *part == '\t')) ++part;
+                while (end > part && (end[-1] == ' ' || end[-1] == '\t')) --end;
+                size_t len = static_cast<size_t>(end - part);
+                if (len >= outSz) len = outSz - 1;
+                if (len) std::memcpy(out, part, len);
+                out[len] = '\0';
+                return true;
+            }
+
+            if (!*end) break;
+            part = end + 1;
+            ++cur;
+        }
+        return false;
+    }
+
+    static void CopyString(char* out, size_t outSz, const char* value) noexcept
+    {
+        if (!out || outSz == 0) return;
+        out[0] = '\0';
+        if (!value) return;
+        std::strncpy(out, value, outSz - 1);
+        out[outSz - 1] = '\0';
+    }
+
+    static std::string TrimCopy(std::string value)
+    {
+        size_t first = 0;
+        while (first < value.size() && (value[first] == ' ' || value[first] == '\t')) ++first;
+        size_t last = value.size();
+        while (last > first)
+        {
+            const char c = value[last - 1];
+            if (c != ' ' && c != '\t' && c != '\r' && c != '\n') break;
+            --last;
+        }
+        return value.substr(first, last - first);
+    }
+
+    static std::string NormalizeCsvName(const std::string& value)
+    {
+        std::string out;
+        out.reserve(value.size());
+        for (char c : value)
+        {
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) out.push_back(c);
+        }
+        return out;
+    }
+
+    static std::vector<std::string> ParseCsvLine(const char* line)
+    {
+        std::vector<std::string> fields;
+        std::string field;
+        bool quoted = false;
+        for (const char* p = line; *p; ++p)
+        {
+            char c = *p;
+            if (c == '\r' || c == '\n')
+            {
+                if (!quoted) break;
+            }
+            if (quoted)
+            {
+                if (c == '"')
+                {
+                    if (p[1] == '"') { field.push_back('"'); ++p; }
+                    else quoted = false;
+                }
+                else field.push_back(c);
+            }
+            else
+            {
+                if (c == '"') quoted = true;
+                else if (c == ',') { fields.push_back(TrimCopy(field)); field.clear(); }
+                else field.push_back(c);
+            }
+        }
+        fields.push_back(TrimCopy(field));
+        return fields;
+    }
+
+    static int FindCsvColumn(const std::vector<std::string>& header, const char* name)
+    {
+        const std::string wanted = NormalizeCsvName(name);
+        for (size_t i = 0; i < header.size(); ++i)
+            if (NormalizeCsvName(header[i]) == wanted)
+                return static_cast<int>(i);
+        return -1;
+    }
+
+    static const char* CsvField(const std::vector<std::string>& row, int column) noexcept
+    {
+        if (column < 0 || static_cast<size_t>(column) >= row.size()) return "";
+        return row[static_cast<size_t>(column)].c_str();
+    }
+
+    static bool ParseU32(const char* text, uint32_t* out) noexcept
+    {
+        if (!text || !*text || !out) return false;
+        char* end = nullptr;
+        unsigned long value = std::strtoul(text, &end, 10);
+        if (end == text) return false;
+        *out = static_cast<uint32_t>(value);
+        return true;
+    }
+
+    static bool StartsWithCI(const char* s, const char* prefix) noexcept;
+    static bool ContainsCI(const char* s, const char* needle) noexcept;
+
+    static uint32_t ParseModelColumn(const char* value) noexcept
+    {
+        if (!value || !*value) return static_cast<uint32_t>(-1);
+        uint32_t numeric = 0;
+        if (ParseU32(value, &numeric))
+        {
+            if (numeric == 0 || numeric == 1) return numeric;
+            if (numeric == 2) return 1;
+            return static_cast<uint32_t>(-1);
+        }
+
+        if (ContainsCI(value, "ModelName_1") || ContainsCI(value, "ModelTexture_1") ||
+            ContainsCI(value, "Model_1") || ContainsCI(value, "Texture_1"))
+            return 0;
+        if (ContainsCI(value, "ModelName_2") || ContainsCI(value, "ModelTexture_2") ||
+            ContainsCI(value, "Model_2") || ContainsCI(value, "Texture_2"))
+            return 1;
+        return static_cast<uint32_t>(-1);
+    }
+
+    static void NormalizedStemKey(const char* value, char* out, size_t outSz) noexcept
+    {
+        if (!out || outSz == 0) return;
+        out[0] = '\0';
+        if (!value) return;
+
+        const char* base = value;
+        for (const char* p = value; *p; ++p)
+            if (*p == '\\' || *p == '/') base = p + 1;
+
+        const char* end = base + std::strlen(base);
+        for (const char* p = base; *p; ++p)
+        {
+            if (*p == ':' || *p == '.') { end = p; break; }
+        }
+
+        size_t n = 0;
+        for (const char* p = base; p < end && n + 1 < outSz; ++p)
+        {
+            char c = *p;
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')
+                out[n++] = c;
+        }
+        out[n] = '\0';
+    }
+
+    static bool ModelStemMatches(const char* sidecarModel, const char* model) noexcept
+    {
+        if (!sidecarModel || !*sidecarModel) return true;
+        char a[264], b[264];
+        NormalizedStemKey(sidecarModel, a, sizeof(a));
+        NormalizedStemKey(model, b, sizeof(b));
+        return a[0] && b[0] && std::strcmp(a, b) == 0;
+    }
+
+    static uint32_t ParseSidecarSlot(const char* slot) noexcept
+    {
+        if (!slot || !*slot) return static_cast<uint32_t>(-1);
+        uint32_t numeric = 0;
+        if (ParseU32(slot, &numeric) && numeric < 11) return numeric;
+
+        if (StartsWithCI(slot, "Head")) return 0;
+        if (StartsWithCI(slot, "Shoulder")) return 1;
+        if (StartsWithCI(slot, "Shirt")) return 2;
+        if (StartsWithCI(slot, "Chest") || StartsWithCI(slot, "Robe")) return 3;
+        if (StartsWithCI(slot, "Waist") || StartsWithCI(slot, "Belt")) return 4;
+        if (StartsWithCI(slot, "Leg") || StartsWithCI(slot, "Pant")) return 5;
+        if (StartsWithCI(slot, "Foot") || StartsWithCI(slot, "Feet") || StartsWithCI(slot, "Boot")) return 6;
+        if (StartsWithCI(slot, "Bracer") || StartsWithCI(slot, "Wrist")) return 7;
+        if (StartsWithCI(slot, "Glove") || StartsWithCI(slot, "Hand")) return 8;
+        if (StartsWithCI(slot, "Cape") || StartsWithCI(slot, "Back") || StartsWithCI(slot, "Cloak")) return 9;
+        if (StartsWithCI(slot, "Tabard")) return 10;
+        return static_cast<uint32_t>(-1);
+    }
+
+    static uint32_t ModelFlagsForSuffixPolicy(const char* policy) noexcept
+    {
+        if (policy && (StartsWithCI(policy, "DBC") || StartsWithCI(policy, "Slot"))) return 0xffffffffu;
+        if (!policy || !*policy || StartsWithCI(policy, "Exact")) return 0x2 | 0x4;
+        if (StartsWithCI(policy, "None")) return 0x2 | 0x4;
+        if (StartsWithCI(policy, "Retail")) return 0x40;
+        if (StartsWithCI(policy, "New")) return 0x40;
+        if (StartsWithCI(policy, "Legacy")) return 0;
+        if (StartsWithCI(policy, "Race")) return 0;
+        return 0x2 | 0x4;
+    }
+
+    static uint32_t TextureFlagsForPolicy(const char* policy) noexcept
+    {
+        if (policy && (StartsWithCI(policy, "DBC") || StartsWithCI(policy, "Slot"))) return 0xffffffffu;
+        if (!policy || !*policy || StartsWithCI(policy, "Exact")) return 0;
+        if (StartsWithCI(policy, "None")) return 0;
+        if (StartsWithCI(policy, "Retail")) return 0x8 | 0x10 | 0x40;
+        if (StartsWithCI(policy, "New")) return 0x8 | 0x10 | 0x40;
+        if (StartsWithCI(policy, "Legacy")) return 0x8 | 0x10;
+        if (StartsWithCI(policy, "Race")) return 0x8 | 0x10;
+        return 0;
     }
 
     static void ParseAttachField(const char* start, const char* end,
@@ -379,10 +755,389 @@ namespace wxl::scripts::equipextension
         }
     }
 
+    static bool Icon2FieldHasValue(const char* icon2str, uint32_t fieldIndex)
+    {
+        if (!icon2str) return false;
+        const char* start = icon2str;
+        for (uint32_t i = 0; i < fieldIndex; ++i)
+        {
+            while (*start && *start != ':') ++start;
+            if (*start != ':') return false;
+            ++start;
+        }
+        const char* end = start;
+        while (*end && *end != ':') ++end;
+        return end > start;
+    }
+
+    static bool StartsWithCI(const char* s, const char* prefix) noexcept
+    {
+        if (!s || !prefix) return false;
+        while (*prefix)
+        {
+            char a = *s++;
+            char b = *prefix++;
+            if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = static_cast<char>(b - 'A' + 'a');
+            if (a != b) return false;
+        }
+        return true;
+    }
+
+    static bool ContainsCI(const char* s, const char* needle) noexcept
+    {
+        if (!s || !needle || !*needle) return false;
+        for (const char* p = s; *p; ++p)
+        {
+            const char* a = p;
+            const char* b = needle;
+            while (*a && *b)
+            {
+                char ca = *a++;
+                char cb = *b++;
+                if (ca >= 'A' && ca <= 'Z') ca = static_cast<char>(ca - 'A' + 'a');
+                if (cb >= 'A' && cb <= 'Z') cb = static_cast<char>(cb - 'A' + 'a');
+                if (ca != cb) break;
+            }
+            if (!*b) return true;
+        }
+        return false;
+    }
+
+    static bool IsKnownObjectComponentFolder(const char* folder, size_t len) noexcept
+    {
+        static const char* kFolders[] = {
+            "Head", "Shoulder", "Shirt", "Chest", "Waist", "Leg", "Foot",
+            "Bracer", "Glove", "Cape", "Tabard", "Collections",
+        };
+
+        for (const char* known : kFolders)
+        {
+            size_t knownLen = std::strlen(known);
+            if (knownLen != len) continue;
+
+            bool match = true;
+            for (size_t i = 0; i < len; ++i)
+            {
+                char a = folder[i];
+                char b = known[i];
+                if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+                if (b >= 'A' && b <= 'Z') b = static_cast<char>(b - 'A' + 'a');
+                if (a != b)
+                {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return true;
+        }
+        return false;
+    }
+
+    static const char* InferObjectComponentFolder(const char* name, bool isCollection,
+                                                  const char* customFolder,
+                                                  const char* slotFolder) noexcept
+    {
+        if (customFolder && *customFolder) return customFolder;
+        if (isCollection) return "Collections";
+        if (StartsWithCI(name, "lshoulder_") || StartsWithCI(name, "rshoulder_") ||
+            StartsWithCI(name, "shoulder_") || ContainsCI(name, "_shoulder_l") ||
+            ContainsCI(name, "_shoulder_r"))
+            return "Shoulder";
+        if (StartsWithCI(name, "cape_")) return "Cape";
+        if (StartsWithCI(name, "tabard_")) return "Tabard";
+        return slotFolder;
+    }
+
+    static uint32_t InferObjectComponentAttach(const char* name, bool isCollection,
+                                               bool explicitAttach,
+                                               uint32_t attach) noexcept
+    {
+        if (explicitAttach || isCollection) return attach;
+        if (StartsWithCI(name, "lshoulder_") || ContainsCI(name, "_shoulder_l")) return 6;
+        if (StartsWithCI(name, "rshoulder_") || ContainsCI(name, "_shoulder_r")) return 5;
+        if (StartsWithCI(name, "collections_"))
+        {
+            if (ContainsCI(name, "_shoulder_l")) return 6;
+            if (ContainsCI(name, "_shoulder_r")) return 5;
+            if (StartsWithCI(name, "collections_belt_") || ContainsCI(name, "_belt")) return 53;
+        }
+        if (StartsWithCI(name, "cape_")) return 12;
+        if (StartsWithCI(name, "tabard_")) return 34;
+        return attach;
+    }
+
+    static bool SlotAllowsNormalObjectModel(uint32_t modelSlot) noexcept
+    {
+        switch (modelSlot)
+        {
+            case 0:  // Head
+            case 1:  // Shoulder
+            case 4:  // Waist / 3D belts
+            case 9:  // Back/cape
+            case 10: // Tabard
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    static bool IsCollectionObjectPath(const char* path) noexcept
+    {
+        return ContainsCI(path, "objectcomponents\\collections\\") ||
+               ContainsCI(path, "objectcomponents/collections/");
+    }
+
+    static bool IsCollectionGloveBodyModel(uint32_t modelSlot, const char* stem) noexcept
+    {
+        return modelSlot == 8 && stem && ContainsCI(stem, "_glove");
+    }
+
+    static bool NeedsVirtualModel(const AttachEntry& e) noexcept
+    {
+        return e.matTexBuf[0] ||
+               e.geoFilter.count > 0 ||
+               (e.texBuf[0] && IsCollectionObjectPath(e.keyBuf));
+    }
+
+    static bool IsCollectionEntry(const AttachEntry& e) noexcept
+    {
+        return e.geoFilter.count > 0 || IsCollectionObjectPath(e.keyBuf);
+    }
+
+    static bool ShouldDetachDefaultAttachPoints(const AttachEntry& e) noexcept
+    {
+        if (e.equipSlot >= 11) return false;
+        if (e.equipSlot == 8 && e.attachId == kCollectionAttach) return false;
+        return true;
+    }
+
+    static void AnalyzeModelList(const char* list, bool* hasCollection, bool* hasNormal)
+    {
+        char part[264] = {};
+        for (uint32_t idx = 0; idx < 16; ++idx)
+        {
+            if (!CopyListPart(list, idx, part, sizeof(part))) break;
+            if (!part[0]) continue;
+            if (std::strchr(part, ':')) *hasCollection = true;
+            else                        *hasNormal = true;
+        }
+    }
+
+    static bool ReadSidecarLines(const char* path, std::vector<std::string>& lines)
+    {
+        lines.clear();
+        if (!path || !*path) return false;
+
+        if (FILE* f = std::fopen(path, "rb"))
+        {
+            char line[4096];
+            while (std::fgets(line, sizeof(line), f))
+                lines.emplace_back(line);
+            std::fclose(f);
+            return !lines.empty();
+        }
+
+        namespace io    = wxl::game::io;
+        namespace iooff = wxl::offsets::engine::io;
+
+        void* handle = nullptr;
+        if (!io::FileOpen(path, iooff::kOpenWholeFile, &handle) || !handle)
+            return false;
+
+        uint32_t sizeHigh = 0;
+        const uint32_t size = io::FileSize(handle, &sizeHigh);
+        std::string bytes;
+        bool ok = false;
+        if (size > 0 && sizeHigh == 0)
+        {
+            bytes.resize(size);
+            uint32_t got = 0;
+            io::FileRead(handle, &bytes[0], size, &got);
+            ok = (got == size);
+        }
+        io::FileClose(handle);
+        if (!ok) return false;
+
+        size_t start = 0;
+        for (size_t i = 0; i <= bytes.size(); ++i)
+        {
+            if (i != bytes.size() && bytes[i] != '\n') continue;
+            std::string line = bytes.substr(start, i - start);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            lines.push_back(line);
+            start = i + 1;
+        }
+        return !lines.empty();
+    }
+
+    static void LoadSidecarFile(const char* path)
+    {
+        std::vector<std::string> lines;
+        if (!ReadSidecarLines(path, lines)) return;
+
+        const std::vector<std::string> header = ParseCsvLine(lines[0].c_str());
+        const int cDisplay = FindCsvColumn(header, "DisplayID");
+        const int cSlot = FindCsvColumn(header, "Slot");
+        int cModel = FindCsvColumn(header, "Model");
+        if (cModel < 0) cModel = FindCsvColumn(header, "ModelStem");
+        if (cModel < 0) cModel = FindCsvColumn(header, "ModelName");
+        int cTexture = FindCsvColumn(header, "Texture");
+        if (cTexture < 0) cTexture = FindCsvColumn(header, "TextureStem");
+        if (cTexture < 0) cTexture = FindCsvColumn(header, "ModelTexture");
+        const int cFolder = FindCsvColumn(header, "Folder");
+        const int cGeosets = FindCsvColumn(header, "Geosets");
+        const int cAttach = FindCsvColumn(header, "Attach");
+        const int cSuffixPolicy = FindCsvColumn(header, "SuffixPolicy");
+        const int cTexturePolicy = FindCsvColumn(header, "TexturePolicy");
+        const int cFlags = FindCsvColumn(header, "Flags");
+
+        if (cDisplay < 0 || cModel < 0)
+        {
+            EquipLog("sidecar '%s': missing DisplayID or Model column", path);
+            return;
+        }
+
+        uint32_t loaded = 0;
+        for (size_t lineIndex = 1; lineIndex < lines.size(); ++lineIndex)
+        {
+            if (lines[lineIndex].empty()) continue;
+            const std::vector<std::string> row = ParseCsvLine(lines[lineIndex].c_str());
+            uint32_t displayId = 0;
+            if (!ParseU32(CsvField(row, cDisplay), &displayId) || displayId == 0) continue;
+
+            SidecarModelEntry e = {};
+            e.modelSlot = ParseSidecarSlot(CsvField(row, cSlot));
+            e.modelFlags = ModelFlagsForSuffixPolicy(CsvField(row, cSuffixPolicy));
+            e.textureFlags = TextureFlagsForPolicy(CsvField(row, cTexturePolicy));
+
+            uint32_t attach = static_cast<uint32_t>(-1);
+            if (ParseU32(CsvField(row, cAttach), &attach)) e.attachId = attach;
+
+            uint32_t extraFlags = 0;
+            if (ParseU32(CsvField(row, cFlags), &extraFlags)) e.modelFlags |= extraFlags;
+
+            CopyString(e.folder, sizeof(e.folder), CsvField(row, cFolder));
+            CopyString(e.model, sizeof(e.model), CsvField(row, cModel));
+            CopyString(e.texture, sizeof(e.texture), CsvField(row, cTexture));
+
+            char* colon = std::strchr(e.model, ':');
+            if (colon)
+            {
+                *colon = '\0';
+                e.geoFilter = ParseGeosetFilter(colon + 1);
+            }
+            const char* geosets = CsvField(row, cGeosets);
+            if (geosets && *geosets) e.geoFilter = ParseGeosetFilter(geosets);
+            if (!e.model[0]) continue;
+
+            g_sidecarModels[displayId].push_back(e);
+            ++loaded;
+        }
+
+        if (loaded)
+            EquipLog("sidecar loaded '%s' rows=%u", path, loaded);
+    }
+
+    static void LoadMaterialSidecarFile(const char* path)
+    {
+        std::vector<std::string> lines;
+        if (!ReadSidecarLines(path, lines)) return;
+
+        const std::vector<std::string> header = ParseCsvLine(lines[0].c_str());
+        const int cDisplay = FindCsvColumn(header, "DisplayID");
+        const int cModelIndex = FindCsvColumn(header, "ModelIndex");
+        const int cModelColumn = FindCsvColumn(header, "ModelColumn");
+        const int cModel = FindCsvColumn(header, "Model");
+        const int cLayer = FindCsvColumn(header, "Layer");
+        const int cTextureType = FindCsvColumn(header, "TextureType");
+        const int cFolder = FindCsvColumn(header, "Folder");
+        const int cTexture = FindCsvColumn(header, "Texture");
+        const int cSkinSectionIds = FindCsvColumn(header, "SkinSectionIDs");
+        const int cBatchIndexes = FindCsvColumn(header, "BatchIndexes");
+        const int cTargetSkinSectionIds = FindCsvColumn(header, "TargetSkinSectionIDs");
+        const int cTargetBatchIndexes = FindCsvColumn(header, "TargetBatchIndexes");
+        const int cTargetMode = FindCsvColumn(header, "TargetMode");
+
+        if (cDisplay < 0 || cLayer < 0 || cTexture < 0)
+        {
+            EquipLog("material sidecar '%s': missing DisplayID, Layer, or Texture column", path);
+            return;
+        }
+
+        uint32_t loaded = 0;
+        for (size_t lineIndex = 1; lineIndex < lines.size(); ++lineIndex)
+        {
+            if (lines[lineIndex].empty()) continue;
+            const std::vector<std::string> row = ParseCsvLine(lines[lineIndex].c_str());
+            uint32_t displayId = 0;
+            if (!ParseU32(CsvField(row, cDisplay), &displayId) || displayId == 0) continue;
+
+            SidecarMaterialEntry e = {};
+            ParseU32(CsvField(row, cModelIndex), &e.modelIndex);
+            e.modelColumn = ParseModelColumn(CsvField(row, cModelColumn));
+            if (e.modelColumn == static_cast<uint32_t>(-1))
+                e.modelColumn = ParseModelColumn(CsvField(row, cModelIndex));
+            if (!ParseU32(CsvField(row, cLayer), &e.layer) || e.layer > 15) continue;
+            if (cTextureType >= 0)
+                ParseU32(CsvField(row, cTextureType), &e.textureType);
+
+            CopyString(e.folder, sizeof(e.folder), CsvField(row, cFolder));
+            CopyString(e.model, sizeof(e.model), CsvField(row, cModel));
+            CopyString(e.texture, sizeof(e.texture), CsvField(row, cTexture));
+            CopyString(e.skinSectionIds, sizeof(e.skinSectionIds), CsvField(row, cSkinSectionIds));
+            CopyString(e.batchIndexes, sizeof(e.batchIndexes), CsvField(row, cBatchIndexes));
+            CopyString(e.targetSkinSectionIds, sizeof(e.targetSkinSectionIds), CsvField(row, cTargetSkinSectionIds));
+            CopyString(e.targetBatchIndexes, sizeof(e.targetBatchIndexes), CsvField(row, cTargetBatchIndexes));
+            CopyString(e.targetMode, sizeof(e.targetMode), CsvField(row, cTargetMode));
+            if (!e.texture[0]) continue;
+
+            g_sidecarMaterials[displayId].push_back(e);
+            ++loaded;
+        }
+
+        if (loaded)
+            EquipLog("material sidecar loaded '%s' rows=%u", path, loaded);
+    }
+
+    static void LoadSidecarModels()
+    {
+        if (g_sidecarLoaded) return;
+        g_sidecarLoaded = true;
+
+        LoadSidecarFile("WXLItemDisplayModels.csv");
+        LoadSidecarFile("DBFilesClient\\WXLItemDisplayModels.csv");
+        LoadMaterialSidecarFile("WXLItemDisplayModelMaterials.csv");
+        LoadMaterialSidecarFile("DBFilesClient\\WXLItemDisplayModelMaterials.csv");
+
+        WIN32_FIND_DATAA fd = {};
+        HANDLE h = FindFirstFileA("Data\\*.MPQ", &fd);
+        if (h != INVALID_HANDLE_VALUE)
+        {
+            do
+            {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                std::string path = "Data\\";
+                path += fd.cFileName;
+                path += "\\DBFilesClient\\WXLItemDisplayModels.csv";
+                LoadSidecarFile(path.c_str());
+                path = "Data\\";
+                path += fd.cFileName;
+                path += "\\DBFilesClient\\WXLItemDisplayModelMaterials.csv";
+                LoadMaterialSidecarFile(path.c_str());
+            }
+            while (FindNextFileA(h, &fd));
+            FindClose(h);
+        }
+
+        EquipLog("sidecar table ready: displays=%zu materialDisplays=%zu",
+                 g_sidecarModels.size(), g_sidecarMaterials.size());
+    }
+
     // ─── Path builders ────────────────────────────────────────────────────────────
 
     // Builds the virtual M2 path: "Item\ObjectComponents\<folder>\[<stem>\]<stem>_<race>[_]<gender>.mdx"
-    // Folder priority: customFolder > (isCollection ? "Collections" : slotFolder).
+    // Folder priority: customFolder > collection/cape stem inference > slotFolder.
     // flags: 0x2=no gender, 0x4=no race, 0x20=subfolder, 0x40=new _Hu_F underscore between race+gender.
     static void BuildSlotPath(char* buf, const char* modelName,
                                const char* raceCode, const char* genderStr,
@@ -394,9 +1149,7 @@ namespace wxl::scripts::equipextension
         bool subFolder    = (flags & 0x20) != 0;
         bool newSuffix    = (flags & 0x40) != 0;
 
-        const char* folder = slotFolder;
-        if (customFolder && *customFolder) folder = customFolder;
-        else if (isCollection)             folder = "Collections";
+        const char* folder = InferObjectComponentFolder(modelName, isCollection, customFolder, slotFolder);
 
         char* p = buf;
         for (const char* s = "Item\\ObjectComponents\\"; *s; ) *p++ = *s++;
@@ -440,11 +1193,25 @@ namespace wxl::scripts::equipextension
         bool subFolder    = (flags & 0x20) != 0;
         bool newSuffix    = (flags & 0x40) != 0;
 
-        const char* folder = slotFolder;
-        if (customFolder && *customFolder) folder = customFolder;
-        else if (isCollection)             folder = "Collections";
+        char explicitFolder[32] = {};
+        const char* texStem = texName;
+        for (const char* s = texName; *s; ++s)
+        {
+            if (*s != '\\' && *s != '/') continue;
+            size_t folderLen = static_cast<size_t>(s - texName);
+            if (folderLen > 0 && folderLen < sizeof(explicitFolder)
+                && IsKnownObjectComponentFolder(texName, folderLen))
+            {
+                std::memcpy(explicitFolder, texName, folderLen);
+                explicitFolder[folderLen] = '\0';
+                texStem = s + 1;
+            }
+            break;
+        }
 
-        const char* subBase = (modelStem && *modelStem) ? modelStem : texName;
+        const char* subBase = (modelStem && *modelStem) ? modelStem : texStem;
+        const char* folder = InferObjectComponentFolder(subBase, isCollection, customFolder, slotFolder);
+        if (explicitFolder[0]) folder = explicitFolder;
         size_t subBaseLen = std::strlen(subBase);
         for (const char* s = subBase; *s; s++)
             if (*s == '.') { subBaseLen = static_cast<size_t>(s - subBase); break; }
@@ -459,7 +1226,7 @@ namespace wxl::scripts::equipextension
             for (size_t i = 0; i < subBaseLen; ++i) *p++ = subBase[i];
             *p++ = '\\';
         }
-        for (const char* s = texName; *s; ) *p++ = *s++;
+        for (const char* s = texStem; *s; ) *p++ = *s++;
         if (appendRace || appendGender)
         {
             *p++ = '_';
@@ -470,6 +1237,160 @@ namespace wxl::scripts::equipextension
         *p++ = '.'; *p++ = 'b'; *p++ = 'l'; *p++ = 'p'; *p = '\0';
         std::strncpy(buf, tmp, bufSz - 1);
         buf[bufSz - 1] = '\0';
+    }
+
+    static bool MaterialEntryMatches(const SidecarMaterialEntry& e,
+                                     uint32_t modelColumn,
+                                     uint32_t partIndex,
+                                     const char* modelName) noexcept
+    {
+        const bool hasModelName = e.model[0] != '\0';
+        if (hasModelName && !ModelStemMatches(e.model, modelName)) return false;
+        if (!hasModelName &&
+            e.modelColumn != static_cast<uint32_t>(-1) &&
+            e.modelColumn != modelColumn)
+            return false;
+        if (hasModelName &&
+            modelColumn != static_cast<uint32_t>(-1) &&
+            e.modelColumn != static_cast<uint32_t>(-1) &&
+            e.modelColumn != modelColumn)
+            return false;
+
+        if (!hasModelName && e.modelColumn == static_cast<uint32_t>(-1) &&
+            e.modelIndex != static_cast<uint32_t>(-1))
+        {
+            const bool columnKnown = modelColumn != static_cast<uint32_t>(-1);
+            const bool columnMatch = columnKnown &&
+                (e.modelIndex == modelColumn || e.modelIndex == modelColumn + 1);
+            const bool partMatch = e.modelIndex == partIndex || e.modelIndex == partIndex + 1;
+            if (!columnMatch && !partMatch)
+                return false;
+        }
+
+        return e.layer != static_cast<uint32_t>(-1) && e.texture[0];
+    }
+
+    static const char* FirstNonEmpty(const char* a, const char* b) noexcept
+    {
+        return (a && *a) ? a : ((b && *b) ? b : "");
+    }
+
+    static bool IsNormalHeadShoulderEdgeFadeMaterial(bool isCollection,
+                                                     const char* slotFolder,
+                                                     const char* modelName,
+                                                     const SidecarMaterialEntry& m) noexcept
+    {
+        if (isCollection || m.textureType != 3) return false;
+        return ContainsCI(slotFolder, "Head") ||
+               ContainsCI(slotFolder, "Shoulder") ||
+               ContainsCI(modelName, "helm_") ||
+               ContainsCI(modelName, "shoulder_");
+    }
+
+    static bool HasTargetedMaterialRows(uint32_t displayId,
+                                        uint32_t modelColumn,
+                                        uint32_t partIndex,
+                                        const char* modelName,
+                                        const char* slotFolder,
+                                        bool isCollection) noexcept
+    {
+        auto it = g_sidecarMaterials.find(displayId);
+        if (it == g_sidecarMaterials.end()) return false;
+        for (const SidecarMaterialEntry& m : it->second)
+        {
+            if (!MaterialEntryMatches(m, modelColumn, partIndex, modelName)) continue;
+            const bool edgeFadeHide =
+                IsNormalHeadShoulderEdgeFadeMaterial(isCollection, slotFolder, modelName, m);
+            const bool hideMode = edgeFadeHide ||
+                                  ContainsCI(m.targetMode, "Hide") ||
+                                  StartsWithCI(m.texture, "__hide__") ||
+                                  StartsWithCI(m.texture, "hide");
+            const bool slotTargetMode = ContainsCI(m.targetMode, "SlotGeosets");
+            const bool hasTargets =
+                m.targetBatchIndexes[0] || m.targetSkinSectionIds[0] ||
+                (slotTargetMode && (m.batchIndexes[0] || m.skinSectionIds[0]));
+            if (!hasTargets && !edgeFadeHide) continue;
+            if (!isCollection && !hideMode && m.layer == 0 && m.textureType == 2) continue;
+            return true;
+        }
+        return false;
+    }
+
+    static void BuildMaterialPatchSpec(char* out, size_t outSz,
+                                       uint32_t displayId,
+                                       uint32_t modelColumn,
+                                       uint32_t partIndex,
+                                       const char* modelName,
+                                       const char* raceCode,
+                                       const char* genderStr,
+                                       const char* slotFolder,
+                                       bool isCollection,
+                                       const char* customFolder,
+                                       const char* modelStem)
+    {
+        if (!out || outSz == 0) return;
+        out[0] = '\0';
+
+        auto it = g_sidecarMaterials.find(displayId);
+        if (it == g_sidecarMaterials.end()) return;
+        if (!HasTargetedMaterialRows(displayId, modelColumn, partIndex, modelName,
+                                     slotFolder, isCollection)) return;
+
+        size_t used = 0;
+        for (const SidecarMaterialEntry& m : it->second)
+        {
+            if (!MaterialEntryMatches(m, modelColumn, partIndex, modelName)) continue;
+            const bool edgeFadeHide =
+                IsNormalHeadShoulderEdgeFadeMaterial(isCollection, slotFolder, modelName, m);
+            const bool hideMode = edgeFadeHide ||
+                                  ContainsCI(m.targetMode, "Hide") ||
+                                  StartsWithCI(m.texture, "__hide__") ||
+                                  StartsWithCI(m.texture, "hide");
+            if (!isCollection && !hideMode && m.layer == 0 && m.textureType == 2) continue;
+
+            const bool slotTargetMode = ContainsCI(m.targetMode, "SlotGeosets");
+            const bool collectionSkinMapTargets =
+                isCollection && m.batchIndexes[0] && !edgeFadeHide;
+            const char* targetBatches = collectionSkinMapTargets
+                ? m.batchIndexes
+                : FirstNonEmpty(m.targetBatchIndexes, slotTargetMode ? m.batchIndexes : "");
+            const char* targetSections = collectionSkinMapTargets
+                ? ""
+                : FirstNonEmpty(m.targetSkinSectionIds, slotTargetMode ? m.skinSectionIds : "");
+            if (!targetBatches[0] && !targetSections[0] && !edgeFadeHide) continue;
+
+            char texPath[264] = {};
+            if (edgeFadeHide)
+            {
+                std::strncpy(texPath, "__hide__edgefade", sizeof(texPath) - 1);
+                texPath[sizeof(texPath) - 1] = '\0';
+            }
+            else if (hideMode)
+            {
+                std::strncpy(texPath, "__hide__", sizeof(texPath) - 1);
+                texPath[sizeof(texPath) - 1] = '\0';
+            }
+            else
+            {
+                const char* folder = m.folder[0] ? m.folder : customFolder;
+                BuildTexPath(texPath, sizeof(texPath), m.texture, raceCode, genderStr, 0,
+                             slotFolder, isCollection, folder, modelStem);
+            }
+            if (!texPath[0]) continue;
+
+            char item[768];
+            const uint32_t textureType =
+                m.textureType == static_cast<uint32_t>(-1) ? 0xffffffffu : m.textureType;
+            int n = std::snprintf(item, sizeof(item), "%s%u:%u:%s:%s=%s",
+                                  used ? "|" : "", m.layer, textureType,
+                                  targetBatches, targetSections, texPath);
+            if (n <= 0) continue;
+            const size_t len = static_cast<size_t>(n);
+            if (len >= sizeof(item) || used + len >= outSz) break;
+            std::memcpy(out + used, item, len);
+            used += len;
+            out[used] = '\0';
+        }
     }
 
     // ─── Geoset filter ────────────────────────────────────────────────────────────
@@ -497,19 +1418,24 @@ namespace wxl::scripts::equipextension
                 uint16_t lvl   = skin->submeshes[si].level;
                 uint16_t start16 = skin->submeshes[si].indexStart;
                 uint16_t count16 = skin->submeshes[si].indexCount;
-                // skinSectionId=0 is the base/untagged mesh; always keep it.
-                bool visible = (secId == 0);
-                if (!visible)
-                    for (uint32_t fi = 0; fi < filter.count; ++fi)
-                        if (filter.ids[fi] == secId) { visible = true; break; }
+                bool visible = false;
+                for (uint32_t fi = 0; fi < filter.count; ++fi)
+                    if (filter.ids[fi] == secId) { visible = true; break; }
                 EquipLog("    submesh[%u]: skinSectionId=%u level=%u indexStart=%u indexCount=%u -> %s",
                          si, (uint32_t)secId, (uint32_t)lvl, (uint32_t)start16, (uint32_t)count16,
                          visible ? "KEEP" : "ZERO");
                 if (!visible)
                 {
-                    uint32_t start = start16;
                     uint32_t count = count16;
-                    if (count == 0 || start + count > skin->indexCount) continue;
+                    if (count == 0) continue;
+
+                    uint32_t start = (static_cast<uint32_t>(lvl) << 16) | start16;
+                    if (start > skin->indexCount || count > skin->indexCount - start)
+                    {
+                        start = start16;
+                        if (start > skin->indexCount || count > skin->indexCount - start) continue;
+                    }
+
                     std::memset(skin->indices + start, 0, count * sizeof(uint16_t));
                 }
             }
@@ -591,15 +1517,13 @@ namespace wxl::scripts::equipextension
         for (size_t i = 0; i < entries.size(); ++i)
         {
             AttachEntry& e = entries[i];
-            if (e.geoFilter.count == 0) continue;
+            if (!NeedsVirtualModel(e)) continue;
             // Skip if a sibling already processed this (keyBuf, attachId, texBuf) group.
             bool done = false;
             for (size_t j = 0; j < i; ++j)
             {
                 AttachEntry& prev = entries[j];
-                if (prev.geoFilter.count > 0 && prev.attachId == e.attachId &&
-                    std::strcmp(prev.keyBuf, e.keyBuf) == 0 &&
-                    std::strcmp(prev.texBuf,  e.texBuf)  == 0) { done = true; break; }
+                if (NeedsVirtualModel(prev) && SameAttachModelGroup(prev, e)) { done = true; break; }
             }
             if (done) continue;
 
@@ -608,9 +1532,7 @@ namespace wxl::scripts::equipextension
             uint16_t mergedIds[16]; uint32_t mergedCount = 0;
             for (auto& e2 : entries)
             {
-                if (e2.geoFilter.count == 0 || e2.attachId != e.attachId ||
-                    std::strcmp(e2.keyBuf, e.keyBuf) != 0 ||
-                    std::strcmp(e2.texBuf,  e.texBuf)  != 0) continue;
+                if (!SameAttachModelGroup(e2, e)) continue;
                 for (uint32_t fi = 0; fi < e2.geoFilter.count && mergedCount < 16; ++fi)
                 {
                     bool dup = false;
@@ -622,16 +1544,21 @@ namespace wxl::scripts::equipextension
 
             // Build the virtual key and ensure bytes are in the serve table.
             char mangled[264];
-            VPathBuildKey(mangled, sizeof(mangled), cmo, e.keyBuf, mergedIds, mergedCount, e.texBuf);
-            VPathPopulate(cmo, e.keyBuf, mergedIds, mergedCount, e.texBuf);
-            EquipLog("  VPath: '%s' tex='%s' -> '%s' (merged=%u)", e.keyBuf, e.texBuf, mangled, mergedCount);
+            const size_t mangledLen =
+                VPathBuildKey(mangled, sizeof(mangled), cmo, e.keyBuf, mergedIds, mergedCount,
+                              e.texBuf, e.mergeKey, e.matTexBuf);
+            const bool vpathReady = mangledLen != 0 &&
+                VPathPopulate(cmo, e.keyBuf, mergedIds, mergedCount, e.texBuf, e.mergeKey, e.matTexBuf);
+            EquipLog("  VPath: '%s' tex='%s' mat='%s' -> '%s' (merged=%u mergeKey=0x%X)",
+                     e.keyBuf, e.texBuf, e.matTexBuf, vpathReady ? mangled : "(disabled)",
+                     mergedCount, e.mergeKey);
+            if (!vpathReady)
+                continue;
 
             // Propagate the mangled key to all entries in this (keyBuf, attachId, texBuf) group.
             for (auto& e2 : entries)
             {
-                if (e2.geoFilter.count > 0 && e2.attachId == e.attachId &&
-                    std::strcmp(e2.keyBuf, e.keyBuf) == 0 &&
-                    std::strcmp(e2.texBuf,  e.texBuf)  == 0)
+                if (NeedsVirtualModel(e2) && SameAttachModelGroup(e2, e))
                     std::memcpy(e2.mangledKeyBuf, mangled, sizeof(e2.mangledKeyBuf));
             }
         }
@@ -654,8 +1581,7 @@ namespace wxl::scripts::equipextension
             AttachEntry& e = entries[i];
             if (e.renderCtx) continue;  // already set by a sibling
 
-            const char* p1Key = (e.geoFilter.count > 0 && e.mangledKeyBuf[0])
-                                 ? e.mangledKeyBuf : e.keyBuf;
+            const char* p1Key = e.mangledKeyBuf[0] ? e.mangledKeyBuf : e.keyBuf;
             void* rctx = SafeGetRenderCtx(owner28, p1Key);
             EquipLog("  Phase1 GetRenderCtx key='%s' -> 0x%p", p1Key, rctx);
             if (!rctx) continue;
@@ -664,9 +1590,7 @@ namespace wxl::scripts::equipextension
             for (size_t j = i; j < entries.size(); ++j)
             {
                 AttachEntry& e2 = entries[j];
-                if (!e2.renderCtx && e2.attachId == e.attachId &&
-                    std::strcmp(e2.keyBuf, e.keyBuf) == 0 &&
-                    std::strcmp(e2.texBuf,  e.texBuf)  == 0)
+                if (!e2.renderCtx && SameAttachModelGroup(e2, e))
                     e2.renderCtx = rctx;
             }
         }
@@ -686,7 +1610,7 @@ namespace wxl::scripts::equipextension
         for (auto& e : entries)
         {
             detachOnce(e.attachId);
-            if (e.equipSlot < 11)
+            if (ShouldDetachDefaultAttachPoints(e))
             {
                 detachOnce(kSlotConfig[e.equipSlot].defAttach1);
                 detachOnce(kSlotConfig[e.equipSlot].defAttach2);
@@ -705,7 +1629,7 @@ namespace wxl::scripts::equipextension
                 //   (b) Non-collection entry whose Phase1 GetRenderCtx failed: skip.
                 // Loading collection entries are NOT nulled by Phase 2.5; they reach here with a
                 // non-null renderCtx (Phase1's rctx) and fall through to the attach below.
-                if (e.geoFilter.count == 0) continue;
+                if (!NeedsVirtualModel(e)) continue;
                 const char* p3Key = e.mangledKeyBuf[0] ? e.mangledKeyBuf : e.keyBuf;
                 void* rctx = SafeGetRenderCtx(owner28, p3Key);
                 EquipLog("  Phase3[%zu] collection re-acquire key='%s' -> 0x%p", i, p3Key, rctx);
@@ -714,10 +1638,7 @@ namespace wxl::scripts::equipextension
                 for (size_t j = i + 1; j < entries.size(); ++j)
                 {
                     AttachEntry& e2 = entries[j];
-                    if (!e2.renderCtx && e2.geoFilter.count > 0 &&
-                        e2.attachId == e.attachId &&
-                        std::strcmp(e2.keyBuf, e.keyBuf) == 0 &&
-                        std::strcmp(e2.texBuf,  e.texBuf)  == 0)
+                    if (!e2.renderCtx && NeedsVirtualModel(e2) && SameAttachModelGroup(e2, e))
                         e2.renderCtx = rctx;
                 }
             }
@@ -727,20 +1648,32 @@ namespace wxl::scripts::equipextension
             for (size_t j = 0; j < i; ++j)
             {
                 AttachEntry& prev = entries[j];
-                if (prev.renderCtx && prev.attachId == e.attachId &&
-                    std::strcmp(prev.keyBuf, e.keyBuf) == 0 &&
-                    std::strcmp(prev.texBuf,  e.texBuf)  == 0)
+                if (prev.renderCtx && SameAttachModelGroup(prev, e))
                 { alreadyAttached = true; break; }
             }
             if (alreadyAttached) continue;
 
             void* rctx = e.renderCtx;
-            bool isCollection = (e.geoFilter.count > 0);
+            bool isCollection = IsCollectionEntry(e);
 
             if (e.texBuf[0])
             {
                 void* tex = gm2::LoadResource(e.texBuf, 0);
-                if (tex) { gm2::BindTexSlot(rctx, tex); gm2::ReleaseResource(tex); }
+                if (!tex)
+                {
+                    EquipLog("  Phase3[%zu] texture load failed '%s', skip attach", i, e.texBuf);
+                    for (auto& e2 : entries)
+                        if (SameAttachModelGroup(e2, e)) e2.renderCtx = nullptr;
+                    gm2::ReleaseRenderCtx(rctx);
+                    continue;
+                }
+                else
+                {
+                    gm2::BindTexSlot(rctx, tex);
+                    // Do not release here. TextureCreate returns a handle that the render context
+                    // continues to use after BindTexSlot; releasing immediately can recycle it and
+                    // leave the attached M2 sampling the client's missing-texture green.
+                }
             }
 
             // subObj->initFlags & 1: when set (character fully initialised), sub_831630 checks the
@@ -758,9 +1691,7 @@ namespace wxl::scripts::equipextension
             // Propagate boneRemap to siblings sharing (keyBuf, attachId, texBuf).
             for (auto& e2 : entries)
             {
-                if (e2.attachId != e.attachId ||
-                    std::strcmp(e2.keyBuf, e.keyBuf) != 0 ||
-                    std::strcmp(e2.texBuf,  e.texBuf)  != 0) continue;
+                if (!SameAttachModelGroup(e2, e)) continue;
                 if (remap.count > 0) e2.boneRemap = remap;
             }
 
@@ -770,9 +1701,7 @@ namespace wxl::scripts::equipextension
                 GeosetFilter merged = {};
                 for (auto& e2 : entries)
                 {
-                    if (e2.attachId != e.attachId ||
-                        std::strcmp(e2.keyBuf, e.keyBuf) != 0 ||
-                        std::strcmp(e2.texBuf,  e.texBuf)  != 0) continue;
+                    if (!SameAttachModelGroup(e2, e)) continue;
                     for (uint32_t fi = 0; fi < e2.geoFilter.count && merged.count < 16; ++fi)
                     {
                         bool dup = false;
@@ -867,12 +1796,18 @@ namespace wxl::scripts::equipextension
         uint32_t attachB_l = cfg.defAttach2, attachB_r = cfg.defAttach2;
         uint32_t icon2flags = 0;
         char customFolder[64] = {};
+        bool icon2AttachAExplicit = false;
+        bool icon2AttachBExplicit = false;
         // Guard pointer range before dereferencing: a raw integer in g_disp+0x18 could be a
         // small non-null value (GeosetGroup integer) that would AV if dereferenced directly.
         if (icon2str && reinterpret_cast<uintptr_t>(icon2str) > 0x10000
             && *icon2str && (*icon2str == ':' || (*icon2str >= '0' && *icon2str <= '9')))
+        {
+            icon2AttachAExplicit = Icon2FieldHasValue(icon2str, 0);
+            icon2AttachBExplicit = Icon2FieldHasValue(icon2str, 1);
             ParseIcon2(icon2str, &attachA_l, &attachA_r, &attachB_l, &attachB_r,
                        &icon2flags, customFolder, sizeof(customFolder));
+        }
 
         // Use left-side attach values (0x80 sided-slot selection not yet implemented).
         uint32_t attachA = attachA_l;
@@ -936,83 +1871,206 @@ namespace wxl::scripts::equipextension
             else { std::strncpy(stemOut, name, stemSz - 1); stemOut[stemSz - 1] = '\0'; }
         };
 
+        bool rowHasCollection = false;
+        bool rowHasNormal = false;
+        AnalyzeModelList(modelName1, &rowHasCollection, &rowHasNormal);
+        AnalyzeModelList(modelName2, &rowHasCollection, &rowHasNormal);
+        const bool mixedCollectionRow = rowHasCollection && rowHasNormal;
+
         // Effective path flags: collection models always use race+gender; normal models use slot defaults.
         // Icon2 flags 0x2/0x4 can still suppress race/gender regardless.
         auto effectiveFlags = [&](bool isCollection) -> uint32_t
         {
             uint32_t ef = icon2flags;
+            if (isCollection && !(ef & 0x40))
+            {
+                const bool appendsRace = (ef & 0x4) == 0;
+                const bool appendsGender = (ef & 0x2) == 0;
+                if (appendsRace && appendsGender)
+                    ef |= 0x40;
+            }
             if (!isCollection)
             {
-                if (!cfg.defUseRace)   ef |= 0x4;
-                if (!cfg.defUseGender) ef |= 0x2;
+                const bool forceModelRaceGender =
+                    (ef & kFlagForceModelRaceGender) || ((ef & 0x40) && !mixedCollectionRow);
+                if (!forceModelRaceGender)
+                {
+                    if (!cfg.defUseRace)   ef |= 0x4;
+                    if (!cfg.defUseGender) ef |= 0x2;
+                }
             }
             return ef;
         };
 
-        // Model 1
-        if (modelName1 && *modelName1)
+        auto attachForEntry = [](bool isCollection, bool mixedRow, uint32_t columnAttach,
+                                 uint32_t defaultAttach, bool explicitAttach) -> uint32_t
         {
-            char stem1[264]; GeosetFilter geo1;
-            splitModelName(modelName1, stem1, sizeof(stem1), &geo1);
-            bool isCol1 = geo1.count > 0;
-            uint32_t ef1 = effectiveFlags(isCol1);
+            if (mixedRow) return isCollection ? kCollectionAttach : defaultAttach;
+            if (isCollection && !explicitAttach) return kCollectionAttach;
+            return columnAttach;
+        };
 
-            char m1Path[264];
-            BuildSlotPath(m1Path, stem1, raceCode, genderStr, ef1, cfg.folder, isCol1, customFolder);
-
-            char texPath1[264] = {};
-            if (texName1 && *texName1)
-                BuildTexPath(texPath1, sizeof(texPath1), texName1, raceCode, genderStr,
-                             ef1, cfg.folder, isCol1, customFolder, stem1);
-
-            EquipLog("  M1: attach=%u path='%s' tex='%s' geoCount=%u",
-                     attachA, m1Path, texPath1[0] ? texPath1 : "(none)", geo1.count);
-
-            AttachEntry e1 = {};
-            e1.equipSlot = a.modelSlot;
-            e1.attachId  = attachA;
-            e1.subObj    = subObj;
-            std::memcpy(e1.keyBuf, m1Path,   sizeof(e1.keyBuf));
-            std::memcpy(e1.texBuf, texPath1, sizeof(e1.texBuf));
-            e1.geoFilter = geo1;
-            g_attached[cmo].push_back(e1);
-        }
-        else
+        auto addModelList = [&](const char* label, const char* modelList, const char* texList,
+                                uint32_t columnAttach, uint32_t defaultAttach, bool explicitAttach)
         {
-            EquipLog("  M1: no model name, skip");
-        }
+            bool anyModel = false;
+            for (uint32_t idx = 0; idx < 16; ++idx)
+            {
+                char modelPart[264] = {};
+                if (!CopyListPart(modelList, idx, modelPart, sizeof(modelPart))) break;
+                if (!modelPart[0]) continue;
+                anyModel = true;
 
-        // Model 2
-        if (modelName2 && *modelName2 && attachB != static_cast<uint32_t>(-1))
+                char texPart[264] = {};
+                if (!CopyListPart(texList, idx, texPart, sizeof(texPart)))
+                    CopyListPart(texList, 0, texPart, sizeof(texPart));
+
+                char stem[264]; GeosetFilter geo;
+                splitModelName(modelPart, stem, sizeof(stem), &geo);
+                if (!stem[0])
+                {
+                    EquipLog("  %s[%u]: empty stem after split, skip", label, idx);
+                    continue;
+                }
+
+                const bool isCollection = geo.count > 0;
+                if (!isCollection && !SlotAllowsNormalObjectModel(a.modelSlot))
+                {
+                    EquipLog("  %s[%u]: normal model '%s' ignored for texture-only slot %u",
+                             label, idx, stem, a.modelSlot);
+                    continue;
+                }
+
+                const uint32_t ef = effectiveFlags(isCollection);
+                uint32_t attach = attachForEntry(isCollection, mixedCollectionRow, columnAttach,
+                                                 defaultAttach, explicitAttach);
+                attach = InferObjectComponentAttach(stem, isCollection, explicitAttach, attach);
+                if (isCollection && IsCollectionGloveBodyModel(a.modelSlot, stem))
+                    attach = kCollectionAttach;
+                if (attach == static_cast<uint32_t>(-1))
+                {
+                    EquipLog("  %s[%u]: attach==-1, skip", label, idx);
+                    continue;
+                }
+
+                char modelPath[264];
+                BuildSlotPath(modelPath, stem, raceCode, genderStr, ef, cfg.folder,
+                              isCollection, customFolder);
+
+                char texPath[264] = {};
+                if (texPart[0])
+                    BuildTexPath(texPath, sizeof(texPath), texPart, raceCode, genderStr,
+                                 ef, cfg.folder, isCollection, customFolder, stem);
+
+                char matTexSpec[2048] = {};
+                const uint32_t modelColumn = (label && label[1] == '1') ? 0u : 1u;
+                BuildMaterialPatchSpec(matTexSpec, sizeof(matTexSpec), displayId,
+                                       modelColumn, idx, stem, raceCode, genderStr,
+                                       cfg.folder, isCollection, customFolder, stem);
+
+                EquipLog("  %s[%u]: attach=%u path='%s' tex='%s' mat='%s' geoCount=%u",
+                         label, idx, attach, modelPath, texPath[0] ? texPath : "(none)",
+                         matTexSpec, geo.count);
+
+                AttachEntry e = {};
+                e.equipSlot = a.modelSlot;
+                e.attachId  = attach;
+                e.subObj    = subObj;
+                std::memcpy(e.keyBuf, modelPath, sizeof(e.keyBuf));
+                std::memcpy(e.texBuf, texPath,   sizeof(e.texBuf));
+                std::memcpy(e.matTexBuf, matTexSpec, sizeof(e.matTexBuf));
+                e.geoFilter = geo;
+                if (isCollection && mixedCollectionRow)
+                    e.mergeKey = ((a.modelSlot + 1) << 16) |
+                                 ((label && label[1] == '1' ? 1u : 2u) << 8) |
+                                 (idx & 0xFFu);
+                if (e.mergeKey)
+                    EquipLog("  %s[%u]: isolated collection mergeKey=0x%X", label, idx, e.mergeKey);
+                g_attached[cmo].push_back(e);
+            }
+
+            if (!anyModel) EquipLog("  %s: no model name, skip", label);
+        };
+
+        auto addSidecarModels = [&]() -> bool
         {
-            char stem2[264]; GeosetFilter geo2;
-            splitModelName(modelName2, stem2, sizeof(stem2), &geo2);
-            bool isCol2 = geo2.count > 0;
-            uint32_t ef2 = effectiveFlags(isCol2);
+            LoadSidecarModels();
+            auto it = g_sidecarModels.find(displayId);
+            if (it == g_sidecarModels.end() || it->second.empty()) return false;
 
-            char m2Path[264];
-            BuildSlotPath(m2Path, stem2, raceCode, genderStr, ef2, cfg.folder, isCol2, customFolder);
+            bool added = false;
+            uint32_t sidecarIndex = 0;
+            for (const SidecarModelEntry& sc : it->second)
+            {
+                if (sc.modelSlot != static_cast<uint32_t>(-1) && sc.modelSlot != a.modelSlot)
+                    continue;
 
-            char texPath2[264] = {};
-            if (texName2 && *texName2)
-                BuildTexPath(texPath2, sizeof(texPath2), texName2, raceCode, genderStr,
-                             ef2, cfg.folder, isCol2, customFolder, stem2);
+                uint32_t attach = sc.attachId;
+                if (attach == static_cast<uint32_t>(-1))
+                    attach = cfg.defAttach1;
+                if (attach == static_cast<uint32_t>(-1))
+                    continue;
 
-            EquipLog("  M2: attach=%u path='%s' tex='%s' geoCount=%u",
-                     attachB, m2Path, texPath2[0] ? texPath2 : "(none)", geo2.count);
+                const bool isCollectionPath =
+                    (sc.folder[0] && StartsWithCI(sc.folder, "Collections")) ||
+                    sc.geoFilter.count > 0 ||
+                    StartsWithCI(sc.model, "collections_");
+                if (isCollectionPath && IsCollectionGloveBodyModel(a.modelSlot, sc.model))
+                    attach = kCollectionAttach;
+                if (!isCollectionPath && !SlotAllowsNormalObjectModel(a.modelSlot))
+                {
+                    EquipLog("  SC[%u]: normal model '%s' ignored for texture-only slot %u",
+                             sidecarIndex, sc.model, a.modelSlot);
+                    ++sidecarIndex;
+                    continue;
+                }
+                const uint32_t modelFlags =
+                    (sc.modelFlags == 0xffffffffu) ? effectiveFlags(isCollectionPath) : sc.modelFlags;
+                const uint32_t textureFlags =
+                    (sc.textureFlags == 0xffffffffu) ? effectiveFlags(isCollectionPath) : sc.textureFlags;
 
-            AttachEntry e2 = {};
-            e2.equipSlot = a.modelSlot;
-            e2.attachId  = attachB;
-            e2.subObj    = subObj;
-            std::memcpy(e2.keyBuf, m2Path,   sizeof(e2.keyBuf));
-            std::memcpy(e2.texBuf, texPath2, sizeof(e2.texBuf));
-            e2.geoFilter = geo2;
-            g_attached[cmo].push_back(e2);
-        }
-        else
+                char modelPath[264];
+                BuildSlotPath(modelPath, sc.model, raceCode, genderStr, modelFlags, cfg.folder,
+                              isCollectionPath, sc.folder[0] ? sc.folder : nullptr);
+
+                char texPath[264] = {};
+                if (sc.texture[0])
+                    BuildTexPath(texPath, sizeof(texPath), sc.texture, raceCode, genderStr,
+                                 textureFlags, cfg.folder, isCollectionPath,
+                                 sc.folder[0] ? sc.folder : nullptr, sc.model);
+
+                char matTexSpec[2048] = {};
+                BuildMaterialPatchSpec(matTexSpec, sizeof(matTexSpec), displayId,
+                                       static_cast<uint32_t>(-1), sidecarIndex, sc.model,
+                                       raceCode, genderStr, cfg.folder, isCollectionPath,
+                                       sc.folder[0] ? sc.folder : nullptr, sc.model);
+
+                EquipLog("  SC[%u]: attach=%u path='%s' tex='%s' mat='%s' geoCount=%u slot=%u",
+                         sidecarIndex, attach, modelPath, texPath[0] ? texPath : "(none)",
+                         matTexSpec, sc.geoFilter.count, sc.modelSlot);
+
+                AttachEntry e = {};
+                e.equipSlot = a.modelSlot;
+                e.attachId  = attach;
+                e.subObj    = subObj;
+                std::memcpy(e.keyBuf, modelPath, sizeof(e.keyBuf));
+                std::memcpy(e.texBuf, texPath,   sizeof(e.texBuf));
+                std::memcpy(e.matTexBuf, matTexSpec, sizeof(e.matTexBuf));
+                e.geoFilter = sc.geoFilter;
+                g_attached[cmo].push_back(e);
+                added = true;
+                ++sidecarIndex;
+            }
+
+            if (added)
+                EquipLog("  sidecar used for displayId=%u, DBC model lists skipped", displayId);
+            return added;
+        };
+
+        if (!addSidecarModels())
         {
-            EquipLog("  M2: no model name or attachB==-1, skip");
+            addModelList("M1", modelName1, texName1, attachA, cfg.defAttach1, icon2AttachAExplicit);
+            addModelList("M2", modelName2, texName2, attachB, cfg.defAttach2, icon2AttachBExplicit);
         }
 
         EquipLog("  calling RebuildAllModels");
@@ -1073,6 +2131,7 @@ namespace wxl::scripts::equipextension
             {
                 for (auto& entry : entries)
                 {
+                    if (entry.geoFilter.count == 0) continue;
                     if (!entry.renderCtx || entry.boneRemap.count == 0) continue;
                     auto* collBuf = reinterpret_cast<uint8_t*>(
                         GuardedReadPtr(reinterpret_cast<uint8_t*>(entry.renderCtx) + m2::kOffInstBonePalette));
@@ -1088,13 +2147,11 @@ namespace wxl::scripts::equipextension
                         entry.charSweepApplied = true;
                     }
                     const BoneRemap& remap = entry.boneRemap;
-                    for (uint32_t bi = 0; bi < remap.count; ++bi)
+                    if (!CopyRemappedBonesGuarded(collBuf, charBuf, remap))
                     {
-                        uint8_t ci = remap.collToChar[bi];
-                        if (ci == 0xFF) continue;
-                        std::memcpy(collBuf + bi * m2::kBonePaletteStride,
-                                    charBuf + ci * m2::kBonePaletteStride,
-                                    m2::kBonePaletteStride);
+                        EquipLog("  CharSweep(bone): guarded copy failed rctx=0x%p count=%u",
+                                 entry.renderCtx, (uint32_t)remap.count);
+                        entry.renderCtx = nullptr;
                     }
                 }
             }
@@ -1120,18 +2177,28 @@ namespace wxl::scripts::equipextension
                     {
                         // SafeGetRenderCtx guards against dangling hash-table buckets (same
                         // root cause as the RebuildAllModels equip crash — see that function).
-                        const char* pfKey = (entry.geoFilter.count > 0 && entry.mangledKeyBuf[0])
-                                             ? entry.mangledKeyBuf : entry.keyBuf;
+                        const char* pfKey = entry.mangledKeyBuf[0] ? entry.mangledKeyBuf : entry.keyBuf;
                         void* rctx = SafeGetRenderCtx(owner28, pfKey);
                         if (rctx)
                         {
                             if (entry.texBuf[0])
                             {
                                 void* tex = gm2::LoadResource(entry.texBuf, 0);
-                                if (tex) { gm2::BindTexSlot(rctx, tex); gm2::ReleaseResource(tex); }
+                                if (!tex)
+                                {
+                                    EquipLog("  PerFrame reattach texture load failed '%s', skip", entry.texBuf);
+                                    for (auto& e2 : entries)
+                                        if (e2.renderCtx == renderCtx) e2.renderCtx = nullptr;
+                                    gm2::ReleaseRenderCtx(rctx);
+                                    continue;
+                                }
+                                else
+                                {
+                                    gm2::BindTexSlot(rctx, tex);
+                                    // Keep the texture handle alive for the attached render context.
+                                }
                             }
-                            gm2::DetachSlot(entry.subObj, entry.attachId);
-                            gm2::AttachToScene(rctx, entry.subObj, entry.attachId, entry.geoFilter.count > 0);
+                            gm2::AttachToScene(rctx, entry.subObj, entry.attachId, IsCollectionEntry(entry));
                             for (auto& e2 : entries)
                                 if (e2.renderCtx == renderCtx) e2.renderCtx = rctx;
                             gm2::ReleaseRenderCtx(rctx);
@@ -1150,9 +2217,13 @@ namespace wxl::scripts::equipextension
                     return;
                 }
 
+                ProbeRaidWarriorTextureAnimation(entry, renderCtx);
+
                 // Bone matrix copy via 3-pass remap table.
                 // charCtx is the character's render_ctx (= cmo->sceneNode = the outer frame call).
                 // The collection M2's bone buffer is overwritten with corresponding char matrices.
+                if (entry.geoFilter.count == 0) return;
+                if (entry.boneRemap.count == 0) return;
                 void* charCtx = GuardedReadPtr(reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoSceneNode);
                 if (charCtx && charCtx != renderCtx)
                 {
@@ -1234,13 +2305,11 @@ namespace wxl::scripts::equipextension
 
                     if (charBuf && collBuf)
                     {
-                        for (uint32_t i = 0; i < remap.count; ++i)
+                        if (!CopyRemappedBonesGuarded(collBuf, charBuf, remap))
                         {
-                            uint8_t ci = remap.collToChar[i];
-                            if (ci == 0xFF) continue;
-                            std::memcpy(collBuf + i * m2::kBonePaletteStride,
-                                        charBuf + ci * m2::kBonePaletteStride,
-                                        m2::kBonePaletteStride);
+                            EquipLog("  PerFrame(copy): guarded copy failed rctx=0x%p count=%u",
+                                     renderCtx, (uint32_t)remap.count);
+                            entry.renderCtx = nullptr;
                         }
                     }
                 }
@@ -1318,13 +2387,11 @@ namespace wxl::scripts::equipextension
                              (charBuf && collBuf) ? "APPLIED" : "DEFERRED-to-PerFrame");
                     if (charBuf && collBuf)
                         {
-                            for (uint32_t bi = 0; bi < remap.count; ++bi)
+                            if (!CopyRemappedBonesGuarded(collBuf, charBuf, remap))
                             {
-                                uint8_t ci = remap.collToChar[bi];
-                                if (ci == 0xFF) continue;
-                                std::memcpy(collBuf + bi * m2::kBonePaletteStride,
-                                            charBuf + ci * m2::kBonePaletteStride,
-                                            m2::kBonePaletteStride);
+                                EquipLog("  OnM2SkinFinalize(copy): guarded copy failed rctx=0x%p count=%u",
+                                         entry.renderCtx, (uint32_t)remap.count);
+                                entry.renderCtx = nullptr;
                             }
                         }
                     }
@@ -1425,6 +2492,7 @@ namespace wxl::scripts::equipextension
             for (auto& entry : entries)
             {
                 if (entry.renderCtx != renderCtx) continue;
+                if (entry.geoFilter.count == 0) continue;
                 if (entry.boneRemap.count == 0) continue;
                 void* charRctx = GuardedReadPtr(
                     reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoSceneNode);
@@ -1458,13 +2526,11 @@ namespace wxl::scripts::equipextension
                     entry.bbpLogDone = true;
                 }
 
-                for (uint32_t bi = 0; bi < remap.count; ++bi)
+                if (!CopyRemappedBonesGuarded(collBuf, charBuf, remap))
                 {
-                    uint8_t ci = remap.collToChar[bi];
-                    if (ci == 0xFF) continue;
-                    std::memcpy(collBuf + bi * m2::kBonePaletteStride,
-                                charBuf + ci * m2::kBonePaletteStride,
-                                m2::kBonePaletteStride);
+                    EquipLog("  OnBBP(copy): guarded copy failed rctx=0x%p count=%u",
+                             renderCtx, (uint32_t)remap.count);
+                    entry.renderCtx = nullptr;
                 }
                 return; // renderCtx is unique per (keyBuf,attachId,texBuf) group; one copy suffices
             }

@@ -7,7 +7,8 @@ A [WarcraftXL](https://github.com/WarcraftXL/WarcraftXL) module that dramaticall
 ## Requirements
 
 - **WarcraftXL** installed in the WoW 3.3.5a client directory (`d3d9.dll` proxy + `WarcraftXL.dll`).
-- This module is compiled into `WarcraftXL.dll` automatically — no separate DLL, no additional files needed at runtime.
+- This module is compiled into `WarcraftXL.dll` automatically — no separate DLL is needed.
+- Optional WXL sidecar CSVs can be shipped loose or inside a client patch when DBC columns are not expressive enough.
 
 ---
 
@@ -70,9 +71,82 @@ No colon in the name: the lookup path is the normal per-slot directory, suffixed
 
 ---
 
+### Multiple logical models in one DBC column
+
+Use `;` inside a model column when one DBC model slot needs to spawn more than one logical model:
+
+```
+ModelName_1    = shoulder_plate_x_l.mdx;collections_plate_x.mdx:401
+ModelTexture_1 = shoulder_plate_x_red;collections_plate_x_red
+```
+
+- `;` splits `ModelName_1`, `ModelName_2`, `ModelTexture_1`, and `ModelTexture_2` into matching parts.
+- Parts are paired by index. If a texture column has fewer parts than the model column, the first texture is reused.
+- Collection parts still use the normal `:geoset` marker and collection attachment rules.
+- This is mainly useful for retail shoulders where the normal left/right shoulder model needs an additional collection overlay.
+
+---
+
 ### `ModelTexture_1` and `ModelTexture_2`
 
 These columns work exactly as they did for Head and Shoulders. No format change — they are now honoured for all equippable slots.
+
+---
+
+## Optional WXL sidecar CSVs
+
+DBC still remains the primary source, but the module can also read sidecar CSVs when retail data needs more structure than `ItemDisplayInfo.dbc` provides.
+
+Sidecars are searched in:
+
+- `WXLItemDisplayModels.csv`
+- `DBFilesClient\WXLItemDisplayModels.csv`
+- `WXLItemDisplayModelMaterials.csv`
+- `DBFilesClient\WXLItemDisplayModelMaterials.csv`
+- the same `DBFilesClient\...` paths inside every `Data\*.MPQ` patch, including open-folder `.MPQ` patches
+
+Sidecar reads use the client file system first and then the game's IO layer, so packed MPQs and open `.MPQ` folders both work.
+
+### `WXLItemDisplayModels.csv`
+
+Adds structured model rows for a display ID. If at least one model sidecar row exists for a display, the DBC model lists for that display are skipped.
+
+Common columns:
+
+| Column | Meaning |
+|--------|---------|
+| `DisplayID` | ItemDisplayInfo ID. Required. |
+| `Slot` | Slot name or internal model slot index. Examples: `Head`, `Shoulder`, `Chest`, `Glove`, `8`. |
+| `Model` / `ModelStem` / `ModelName` | Model stem or path. Required. May include `:geosets`. |
+| `Texture` / `TextureStem` / `ModelTexture` | Optional model texture stem. |
+| `Folder` | Optional object component folder override, e.g. `Head`, `Shoulder`, `Collections`. |
+| `Geosets` | Optional comma-separated geoset filter. Overrides any `:geosets` suffix in `Model`. |
+| `Attach` | Optional explicit attachment ID. |
+| `SuffixPolicy` | `Exact`/`None`, `Retail`/`New`, `Legacy`/`Race`, or `DBC`/`Slot`. |
+| `TexturePolicy` | Same idea as `SuffixPolicy`, but for texture suffixing. |
+| `Flags` | Extra Icon2-style model flags ORed into the row. |
+
+### `WXLItemDisplayModelMaterials.csv`
+
+Applies model-specific material textures, including special retail layers that should not be packed into `ModelTexture_1/2`.
+
+Common columns:
+
+| Column | Meaning |
+|--------|---------|
+| `DisplayID` | ItemDisplayInfo ID. Required. |
+| `ModelIndex` | Retail model index or part index. |
+| `ModelColumn` | `ModelName_1`, `ModelName_2`, `1`, or `2`. |
+| `Model` | Optional model stem filter. |
+| `Layer` | Material layer index. Required. |
+| `TextureType` | Retail texture type for the material row. |
+| `Folder` | Optional object component folder for texture pathing. |
+| `Texture` | Texture stem, or `__hide__...` for intentional hidden material rows. Required. |
+| `SkinSectionIDs` / `BatchIndexes` | Source skin map information from the converter. |
+| `TargetSkinSectionIDs` / `TargetBatchIndexes` | Batches/geosets that should receive the material row. |
+| `TargetMode` | Targeting behavior, e.g. `SlotGeosets`, `SkinMapOnly`, `HideSlotGeosets`, or `None`. |
+
+Targeted material rows are applied to virtual collection models instead of globally replacing the model's main texture. This is important for retail glow/edgefade/extra-layer materials.
 
 ---
 
@@ -173,8 +247,20 @@ This is mostly meant to show of the various ways to use it, not how it is best t
 
 **Fix:** Clear `ModelName_1` and `ModelName_2` for any non-head/shoulder item that should not have an attached model. A cleanup script may be provided in a future release.
 
-**Unequipping collections**
-Unequipping does not clean up the attachment properly. I'll look into that soon.
+**Sidecar priority:** A display with model sidecar rows uses those rows instead of the DBC model lists. Keep the sidecar complete for that display, or omit it and let the DBC row drive the item.
+
+---
+
+## Debug logging
+
+Equip logging is disabled by default because it touches hot model, skin, and per-frame paths.
+
+Enable it with either:
+
+- environment variable `WXL_EQUIP_LOG=1`
+- a `WarcraftXL_equip.log.enable` flag file next to the client executable
+
+When enabled, diagnostics are appended to `WarcraftXL_equip.log`.
 
 ---
 
