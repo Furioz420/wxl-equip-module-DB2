@@ -150,6 +150,22 @@ Targeted material rows are applied to virtual collection models instead of globa
 
 ---
 
+## Converter scripts
+
+The `tools/dbc-converters/` folder contains the helper scripts used to generate WXL-compatible `ItemDisplayInfo.dbc`, `Item.dbc`, and the optional sidecar CSVs described above.
+
+Included scripts:
+
+- `tools/dbc-converters/itemdisplayinfo/ItemDisplayDBC.py`
+- `tools/dbc-converters/itemdisplayinfo/FinalizeRetailItemDisplayInfo.py`
+- `tools/dbc-converters/item/ItemDBC.py`
+- `tools/dbc-converters/item/CreateSQL.py`
+- `tools/dbc-converters/item/CleanSQL.py`
+
+See `tools/dbc-converters/README.md` for required input exports, generated outputs, and packaging notes. Generated CSVs, SQL dumps, DB2 files, listfiles, and conversion logs are intentionally not committed.
+
+---
+
 ### `Icon2` — attachment point and flag configuration
 
 The `Icon2` field is unused in stock 3.3.5a and is repurposed to configure how Model1 and Model2 are loaded and attached.
