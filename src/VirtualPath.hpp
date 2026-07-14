@@ -40,7 +40,8 @@ namespace wxl::scripts::equipextension
                          const char* realMdxPath,
                          const uint16_t* geoIds, uint32_t geoCount,
                          const char* texPath,
-                         uint32_t variantKey = 0);
+                         uint32_t variantKey = 0,
+                         const char* materialPatchSpec = nullptr);
 
     /**
      * @brief Ensures the virtual .mdx and .skin bytes are in the client serve table.
@@ -55,10 +56,11 @@ namespace wxl::scripts::equipextension
      * @param texPath     full BLP path for the texture slot (may be empty)
      * @param variantKey  optional logical-model discriminator for entries that must not share cache keys
      */
-    void VPathPopulate(void* cmo, const char* realMdxPath,
+    bool VPathPopulate(void* cmo, const char* realMdxPath,
                        const uint16_t* geoIds, uint32_t geoCount,
                        const char* texPath,
-                       uint32_t variantKey = 0);
+                       uint32_t variantKey = 0,
+                       const char* materialPatchSpec = nullptr);
 
     /**
      * @brief Removes all virtual table entries owned by cmo.
