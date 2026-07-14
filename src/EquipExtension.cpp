@@ -16,6 +16,7 @@
 
 #include "EquipExtension.hpp"
 #include "VirtualPath.hpp"
+#include "core/Logger.hpp"
 #include "events/Event.hpp"
 #include "game/Binding.hpp"
 #include "game/io/Io.hpp"
@@ -63,6 +64,8 @@ namespace wxl::scripts::equipextension
     {
         uint16_t count;
         uint8_t  collToChar[256];
+        void*    collectionModel;
+        void*    characterModel;
     };
 
     struct SidecarModelEntry
@@ -110,9 +113,7 @@ namespace wxl::scripts::equipextension
         bool        perFrameLogged    = false; // suppress repeated per-frame noise after first log
         bool        charSweepApplied = false; // set when character-model PerFrame sweep first copies bones
         bool        bbpLogDone       = false; // suppress OnBuildBonePalette remap dump after first fire
-        uint16_t    texAnimProbeFrames = 0; // short targeted UV-animation diagnostic
-        uint32_t    texAnimProbeFirst[4] = {};
-        uint8_t     texAnimProbeChanged = 0;
+        bool        cloneBbpLogDone  = false; // suppress duplicate-ModelFrame fallback noise
     };
 
     // ─── File-scope state ─────────────────────────────────────────────────────────
@@ -199,6 +200,18 @@ namespace wxl::scripts::equipextension
         return enabled != 0;
     }
 
+    static bool BoneCopyEnabled() noexcept
+    {
+        static int enabled = []() noexcept -> int {
+            char env[16] = {};
+            const DWORD n = GetEnvironmentVariableA("WXL_EQUIP_BONE_COPY", env, sizeof(env));
+            if (n > 0 && (env[0] == '0' || env[0] == 'n' || env[0] == 'N' ||
+                          env[0] == 'f' || env[0] == 'F')) return 0;
+            return GetFileAttributesA("WarcraftXL_equip_bone_copy.disable") == INVALID_FILE_ATTRIBUTES ? 1 : 0;
+        }();
+        return enabled != 0;
+    }
+
     // Verbose equip diagnostics are opt-in. They touch very hot model/skin/per-frame paths, and opening
     // + flushing the log for every line can dominate frame time on HD-equipment-heavy scenes.
     static void EquipLog(const char* fmt, ...) noexcept
@@ -244,62 +257,82 @@ namespace wxl::scripts::equipextension
         return v;
     }
 
-    static uint32_t GuardedMatrixHash(const void* matrix) noexcept
+    static void* NativeParentGuarded(void* instance) noexcept
     {
-        if (!matrix) return 0;
-        uint32_t hash = 2166136261u;
+        if (!instance) return nullptr;
+        void* parent = GuardedReadPtr(reinterpret_cast<uint8_t*>(instance) + m2::kOffInstParent);
+        return parent != instance ? parent : nullptr;
+    }
+
+    static void* FindAncestorWithModelGuarded(void* instance, void* wantedModel) noexcept
+    {
+        if (!instance || !wantedModel) return nullptr;
+        void* seen[32] = {};
+        void* current = NativeParentGuarded(instance);
+        for (uint32_t depth = 0; depth < 32; ++depth)
+        {
+            if (!current) return nullptr;
+            for (uint32_t i = 0; i < depth; ++i) if (seen[i] == current) return nullptr;
+            seen[depth] = current;
+            if (GuardedReadPtr(reinterpret_cast<uint8_t*>(current) + m2::kOffInstModel) == wantedModel)
+                return current;
+            current = NativeParentGuarded(current);
+        }
+        return nullptr;
+    }
+
+    static bool BoneRemapHasMatch(const BoneRemap& remap) noexcept
+    {
+        if (remap.count == 0 || remap.count > 256) return false;
+        for (uint32_t i = 0; i < remap.count; ++i) if (remap.collToChar[i] != 0xFF) return true;
+        return false;
+    }
+
+    static bool BoneRemapMatchesContextsGuarded(const BoneRemap& remap, void* collectionCtx,
+                                                void* characterCtx) noexcept
+    {
+        if (!BoneRemapHasMatch(remap) || !collectionCtx || !characterCtx || collectionCtx == characterCtx ||
+            !remap.collectionModel || !remap.characterModel) return false;
+        return GuardedReadPtr(reinterpret_cast<uint8_t*>(collectionCtx) + m2::kOffInstModel) == remap.collectionModel &&
+               GuardedReadPtr(reinterpret_cast<uint8_t*>(characterCtx) + m2::kOffInstModel) == remap.characterModel;
+    }
+
+    static uint32_t RenderCtxBoneCountGuarded(void* renderCtx) noexcept
+    {
+        if (!renderCtx) return 0;
         __try
         {
-            const auto* words = static_cast<const uint32_t*>(matrix);
-            for (uint32_t i = 0; i < 16; ++i)
-                hash = (hash ^ words[i]) * 16777619u;
+            void* model = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstModel);
+            if (!model) return 0;
+            auto* header = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(model) + m2::kOffModelHeader);
+            if (!header) return 0;
+            const uint32_t count = *reinterpret_cast<uint32_t*>(header + m2::kOffHdrBoneCount);
+            return count <= 256 ? count : 0;
         }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            return 0;
-        }
-        return hash;
+        __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
     }
 
-    static void ProbeRaidWarriorTextureAnimation(AttachEntry& entry, void* renderCtx) noexcept
+    static bool CopyRemappedBonesGuarded(uint8_t* dstBuf, uint32_t dstBoneCount,
+                                         const uint8_t* srcBuf, uint32_t srcBoneCount,
+                                         const BoneRemap& remap, void* dstRenderCtx,
+                                         void* srcRenderCtx) noexcept
     {
-        if (entry.texAnimProbeFrames >= 1200 ||
-            !std::strstr(entry.keyBuf, "raidwarriorprogenitor_d_01")) return;
-
-        void* evaluated = GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + 0xAC);
-        void* matrices  = GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + 0xB0);
-        const uint32_t hashes[4] = {
-            GuardedMatrixHash(evaluated),
-            GuardedMatrixHash(evaluated ? reinterpret_cast<uint8_t*>(evaluated) + 0x40 : nullptr),
-            GuardedMatrixHash(matrices),
-            GuardedMatrixHash(matrices ? reinterpret_cast<uint8_t*>(matrices) + 0x40 : nullptr)
-        };
-
-        if (entry.texAnimProbeFrames == 0)
-            std::memcpy(entry.texAnimProbeFirst, hashes, sizeof(hashes));
-        else
-            for (uint32_t i = 0; i < 4; ++i)
-                if (hashes[i] && hashes[i] != entry.texAnimProbeFirst[i])
-                    entry.texAnimProbeChanged |= static_cast<uint8_t>(1u << i);
-
-        ++entry.texAnimProbeFrames;
-        if (entry.texAnimProbeFrames == 1 || entry.texAnimProbeFrames == 30 ||
-            entry.texAnimProbeFrames == 90 || entry.texAnimProbeFrames == 300 ||
-            entry.texAnimProbeFrames == 600 || entry.texAnimProbeFrames == 900 ||
-            entry.texAnimProbeFrames == 1200)
+        if (!BoneCopyEnabled())
         {
-            EquipLog("  TexAnimProbe frame=%u key='%s' eval=[%08X %08X] out=[%08X %08X] changed=0x%X",
-                     static_cast<uint32_t>(entry.texAnimProbeFrames), entry.keyBuf,
-                     hashes[0], hashes[1], hashes[2], hashes[3],
-                     static_cast<uint32_t>(entry.texAnimProbeChanged));
+            static bool logged = false;
+            if (!logged)
+            {
+                logged = true;
+                WLOG_WARN("equip-extension: manual collection bone copies disabled for isolation test");
+            }
+            return true;
         }
-    }
-
-    static bool CopyRemappedBonesGuarded(uint8_t* dstBuf,
-                                         const uint8_t* srcBuf,
-                                         const BoneRemap& remap) noexcept
-    {
-        if (!dstBuf || !srcBuf || remap.count == 0 || remap.count > 256)
+        if (!dstBuf || !srcBuf || dstBuf == srcBuf || !dstRenderCtx || !srcRenderCtx ||
+            remap.count == 0 || remap.count > 256 || dstBoneCount == 0 || srcBoneCount == 0 ||
+            remap.count != dstBoneCount || srcBoneCount > 256 ||
+            !remap.collectionModel || !remap.characterModel ||
+            GuardedReadPtr(reinterpret_cast<uint8_t*>(dstRenderCtx) + m2::kOffInstModel) != remap.collectionModel ||
+            GuardedReadPtr(reinterpret_cast<uint8_t*>(srcRenderCtx) + m2::kOffInstModel) != remap.characterModel)
             return false;
 
         __try
@@ -308,6 +341,7 @@ namespace wxl::scripts::equipextension
             {
                 uint8_t ci = remap.collToChar[bi];
                 if (ci == 0xFF) continue;
+                if (ci >= srcBoneCount) continue;
                 std::memcpy(dstBuf + bi * m2::kBonePaletteStride,
                             srcBuf + ci * m2::kBonePaletteStride,
                             m2::kBonePaletteStride);
@@ -347,6 +381,8 @@ namespace wxl::scripts::equipextension
             void* collM2  = *reinterpret_cast<void**>(collBytes + m2::kOffInstModel);
             void* charM2  = *reinterpret_cast<void**>(charBytes + m2::kOffInstModel);
             if (!collM2 || !charM2) return r;
+            r.collectionModel = collM2;
+            r.characterModel = charM2;
 
             // M2AnimData = raw M2 file buffer = M2FileHeader (at m2_inst+0x150)
             auto* collHdr = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(collM2) + m2::kOffModelHeader);
@@ -364,7 +400,7 @@ namespace wxl::scripts::equipextension
 
             EquipLog("  BuildBoneRemap: collN=%u charN=%u collBase=%p charBase=%p charLut=%p",
                      collN, charN, collBase, charBase, charLut);
-            if (!collBase || collN == 0 || collN > 256) return r;
+            if (!collBase || collN == 0 || collN > 256 || charN == 0 || charN > 256) return r;
             r.count = static_cast<uint16_t>(collN);
 
             // Pass 1a: match by key_bone_id scan of char bone array
@@ -394,7 +430,8 @@ namespace wxl::scripts::equipextension
                     int32_t key = *reinterpret_cast<int32_t*>(collBase + i * m2::kBoneStride + m2::kOffBoneKeyId);
                     if (key < 0 || static_cast<uint32_t>(key) >= charLutN) continue;
                     int16_t ci = charLut[key];
-                    if (ci >= 0) r.collToChar[i] = static_cast<uint8_t>(ci);
+                    if (ci >= 0 && static_cast<uint32_t>(ci) < charN && ci < 255)
+                        r.collToChar[i] = static_cast<uint8_t>(ci);
                 }
             }
 
@@ -414,8 +451,8 @@ namespace wxl::scripts::equipextension
                 }
             }
 
-            // Pass 2: propagate matched values down unmatched parent chains (up to 8 iterations)
-            for (int pass = 0; pass < 8; ++pass)
+            // Accessory chains in paper-doll collection models can be deeper than eight bones.
+            for (uint32_t pass = 0; pass < collN; ++pass)
             {
                 bool changed = false;
                 for (uint32_t i = 0; i < collN; ++i)
@@ -1506,8 +1543,17 @@ namespace wxl::scripts::equipextension
         EquipLog("  RebuildAllModels: %zu entries, subObj=0x%p owner28=0x%p",
                  entries.size(), subObj, owner28);
 
-        // Reset all cached render_ctxes, stamp current subObj, reset per-frame log flag.
-        for (auto& e : entries) { e.renderCtx = nullptr; e.subObj = subObj; e.perFrameLogged = false; }
+        // Reset all state tied to the previous render context.
+        for (auto& e : entries)
+        {
+            e.renderCtx = nullptr;
+            e.subObj = subObj;
+            e.boneRemap = {};
+            e.perFrameLogged = false;
+            e.charSweepApplied = false;
+            e.bbpLogDone = false;
+            e.cloneBbpLogDone = false;
+        }
 
         // Pre-phase: build virtual paths for collection entries and populate the serve table.
         // Each unique (keyBuf, attachId, texBuf) collection group gets one merged geoset filter and one
@@ -1685,8 +1731,10 @@ namespace wxl::scripts::equipextension
                      i, e.attachId, rctx, subInitFlags, (int)isCollection);
             gm2::AttachToScene(rctx, subObj, e.attachId, isCollection);
 
+            void* nativeParent = NativeParentGuarded(rctx);
             BoneRemap remap = BuildBoneRemapGuarded(rctx, subObj);
-            EquipLog("  Phase3[%zu] boneRemap.count=%u", i, (uint32_t)remap.count);
+            EquipLog("  Phase3[%zu] boneRemap.count=%u requestedParent=0x%p nativeParent=0x%p",
+                     i, (uint32_t)remap.count, subObj, nativeParent);
 
             // Propagate boneRemap to siblings sharing (keyBuf, attachId, texBuf).
             for (auto& e2 : entries)
@@ -1771,25 +1819,30 @@ namespace wxl::scripts::equipextension
         uint32_t ok = Native<db2::itemdisplayinfo::LookupFn>(db2::itemdisplayinfo::kLookup)(
             reinterpret_cast<void*>(db2::itemdisplayinfo::kStorageObject),
             nullptr, displayId, dispBuf);
-        if (!ok)
+        const char* modelName1 = nullptr;
+        const char* modelName2 = nullptr;
+        const char* texName1   = nullptr;
+        const char* texName2   = nullptr;
+        const char* icon2str   = nullptr;
+        if (ok)
+        {
+            modelName1 = *reinterpret_cast<const char**>(dispBuf + db2::itemdisplayinfo::kOffModel1);
+            modelName2 = *reinterpret_cast<const char**>(dispBuf + db2::itemdisplayinfo::kOffModel2);
+            texName1   = *reinterpret_cast<const char**>(dispBuf + db2::itemdisplayinfo::kOffTex1);
+            texName2   = *reinterpret_cast<const char**>(dispBuf + db2::itemdisplayinfo::kOffTex2);
+            icon2str   = *reinterpret_cast<const char**>(dispBuf + db2::itemdisplayinfo::kOffIcon2);
+            EquipLog("  DBC ok: model1='%s' model2='%s' tex1='%s' tex2='%s' icon2ptr=0x%p icon2='%s'",
+                     modelName1 ? modelName1 : "(null)", modelName2 ? modelName2 : "(null)",
+                     texName1 ? texName1 : "(null)", texName2 ? texName2 : "(null)",
+                     static_cast<const void*>(icon2str),
+                     (icon2str && reinterpret_cast<uintptr_t>(icon2str) > 0x10000 && *icon2str)
+                         ? icon2str : "(empty/invalid)");
+        }
+        else
         {
             EquipLog("  DBC lookup FAILED (displayId=%u not found)", displayId);
             return;
         }
-
-        const char* modelName1 = *reinterpret_cast<const char**>(dispBuf + db2::itemdisplayinfo::kOffModel1);
-        const char* modelName2 = *reinterpret_cast<const char**>(dispBuf + db2::itemdisplayinfo::kOffModel2);
-        const char* texName1   = *reinterpret_cast<const char**>(dispBuf + db2::itemdisplayinfo::kOffTex1);
-        const char* texName2   = *reinterpret_cast<const char**>(dispBuf + db2::itemdisplayinfo::kOffTex2);
-        const char* icon2str   = *reinterpret_cast<const char**>(dispBuf + db2::itemdisplayinfo::kOffIcon2);
-
-        EquipLog("  DBC ok: model1='%s' model2='%s' tex1='%s' tex2='%s' icon2ptr=0x%p icon2='%s'",
-                 modelName1 ? modelName1 : "(null)",
-                 modelName2 ? modelName2 : "(null)",
-                 texName1   ? texName1   : "(null)",
-                 texName2   ? texName2   : "(null)",
-                 static_cast<const void*>(icon2str),
-                 (icon2str && reinterpret_cast<uintptr_t>(icon2str) > 0x10000 && *icon2str) ? icon2str : "(empty/invalid)");
 
         // Parse Icon2 attach config (start with defaults from slot config).
         uint32_t attachA_l = cfg.defAttach1, attachA_r = cfg.defAttach1;
@@ -2101,7 +2154,12 @@ namespace wxl::scripts::equipextension
         for (auto it = g_attached.begin(); it != g_attached.end(); )
         {
             void* sub = GuardedReadPtr(reinterpret_cast<uint8_t*>(it->first) + m2::kOffCmoSceneNode);
-            if (!sub) { VPathEvictCmo(it->first); it = g_attached.erase(it); }
+            if (!sub)
+            {
+                void* deadCmo = it->first;
+                VPathEvictCmo(deadCmo);
+                it = g_attached.erase(it);
+            }
             else      ++it;
         }
         if (g_attached.empty()) return;
@@ -2131,7 +2189,7 @@ namespace wxl::scripts::equipextension
             {
                 for (auto& entry : entries)
                 {
-                    if (entry.geoFilter.count == 0) continue;
+                    if (!IsCollectionEntry(entry)) continue;
                     if (!entry.renderCtx || entry.boneRemap.count == 0) continue;
                     auto* collBuf = reinterpret_cast<uint8_t*>(
                         GuardedReadPtr(reinterpret_cast<uint8_t*>(entry.renderCtx) + m2::kOffInstBonePalette));
@@ -2147,11 +2205,20 @@ namespace wxl::scripts::equipextension
                         entry.charSweepApplied = true;
                     }
                     const BoneRemap& remap = entry.boneRemap;
-                    if (!CopyRemappedBonesGuarded(collBuf, charBuf, remap))
+                    const uint32_t collBoneCount = RenderCtxBoneCountGuarded(entry.renderCtx);
+                    const uint32_t charBoneCount = RenderCtxBoneCountGuarded(renderCtx);
+                    if (!CopyRemappedBonesGuarded(collBuf, collBoneCount, charBuf, charBoneCount,
+                                                  remap, entry.renderCtx, renderCtx))
                     {
                         EquipLog("  CharSweep(bone): guarded copy failed rctx=0x%p count=%u",
                                  entry.renderCtx, (uint32_t)remap.count);
-                        entry.renderCtx = nullptr;
+                        void* failedCtx = entry.renderCtx;
+                        for (auto& sibling : entries)
+                        {
+                            if (sibling.renderCtx != failedCtx) continue;
+                            sibling.renderCtx = nullptr;
+                            sibling.boneRemap = {};
+                        }
                     }
                 }
             }
@@ -2217,13 +2284,10 @@ namespace wxl::scripts::equipextension
                     return;
                 }
 
-                ProbeRaidWarriorTextureAnimation(entry, renderCtx);
-
                 // Bone matrix copy via 3-pass remap table.
                 // charCtx is the character's render_ctx (= cmo->sceneNode = the outer frame call).
                 // The collection M2's bone buffer is overwritten with corresponding char matrices.
-                if (entry.geoFilter.count == 0) return;
-                if (entry.boneRemap.count == 0) return;
+                if (!IsCollectionEntry(entry)) return;
                 void* charCtx = GuardedReadPtr(reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoSceneNode);
                 if (charCtx && charCtx != renderCtx)
                 {
@@ -2277,6 +2341,12 @@ namespace wxl::scripts::equipextension
                         }
                     }
 
+                    if (remap.count == 0)
+                    {
+                        entry.perFrameLogged = true;
+                        return;
+                    }
+
                     auto* charBuf = reinterpret_cast<uint8_t*>(
                         GuardedReadPtr(reinterpret_cast<uint8_t*>(charCtx) + m2::kOffInstBonePalette));
                     auto* collBuf = reinterpret_cast<uint8_t*>(
@@ -2305,11 +2375,19 @@ namespace wxl::scripts::equipextension
 
                     if (charBuf && collBuf)
                     {
-                        if (!CopyRemappedBonesGuarded(collBuf, charBuf, remap))
+                        const uint32_t collBoneCount = RenderCtxBoneCountGuarded(renderCtx);
+                        const uint32_t charBoneCount = RenderCtxBoneCountGuarded(charCtx);
+                        if (!CopyRemappedBonesGuarded(collBuf, collBoneCount, charBuf, charBoneCount,
+                                                      remap, renderCtx, charCtx))
                         {
                             EquipLog("  PerFrame(copy): guarded copy failed rctx=0x%p count=%u",
                                      renderCtx, (uint32_t)remap.count);
-                            entry.renderCtx = nullptr;
+                            for (auto& sibling : entries)
+                            {
+                                if (sibling.renderCtx != renderCtx) continue;
+                                sibling.renderCtx = nullptr;
+                                sibling.boneRemap = {};
+                            }
                         }
                     }
                 }
@@ -2331,7 +2409,7 @@ namespace wxl::scripts::equipextension
         {
             for (auto& entry : entries)
             {
-                if (!entry.renderCtx || entry.geoFilter.count == 0) continue;
+                if (!entry.renderCtx || !IsCollectionEntry(entry)) continue;
                 void* entryModel = GuardedReadPtr(
                     reinterpret_cast<uint8_t*>(entry.renderCtx) + m2::kOffInstModel);
                 if (entryModel != model) continue;
@@ -2349,14 +2427,17 @@ namespace wxl::scripts::equipextension
                     }
                 }
 
-                auto* skin = gm2::Skin(model);
-                EquipLog("  OnM2SkinFinalize(primary): model=0x%p skin=0x%p merged.count=%u ids=[%u %u %u %u]",
-                         model, static_cast<void*>(skin), merged.count,
-                         merged.count > 0 ? merged.ids[0] : 0,
-                         merged.count > 1 ? merged.ids[1] : 0,
-                         merged.count > 2 ? merged.ids[2] : 0,
-                         merged.count > 3 ? merged.ids[3] : 0);
-                if (skin) ApplyRawTriFilter(skin, merged);
+                if (merged.count > 0)
+                {
+                    auto* skin = gm2::Skin(model);
+                    EquipLog("  OnM2SkinFinalize(primary): model=0x%p skin=0x%p merged.count=%u ids=[%u %u %u %u]",
+                             model, static_cast<void*>(skin), merged.count,
+                             merged.count > 0 ? merged.ids[0] : 0,
+                             merged.count > 1 ? merged.ids[1] : 0,
+                             merged.count > 2 ? merged.ids[2] : 0,
+                             merged.count > 3 ? merged.ids[3] : 0);
+                    if (skin) ApplyRawTriFilter(skin, merged);
+                }
 
                 // Bone remap: apply immediately on async load completion.
                 // OnM2SkinFinalize is the earliest moment entry.renderCtx is valid and the
@@ -2387,11 +2468,20 @@ namespace wxl::scripts::equipextension
                              (charBuf && collBuf) ? "APPLIED" : "DEFERRED-to-PerFrame");
                     if (charBuf && collBuf)
                         {
-                            if (!CopyRemappedBonesGuarded(collBuf, charBuf, remap))
+                            const uint32_t collBoneCount = RenderCtxBoneCountGuarded(entry.renderCtx);
+                            const uint32_t charBoneCount = RenderCtxBoneCountGuarded(charCtx);
+                            if (!CopyRemappedBonesGuarded(collBuf, collBoneCount, charBuf, charBoneCount,
+                                                          remap, entry.renderCtx, charCtx))
                             {
                                 EquipLog("  OnM2SkinFinalize(copy): guarded copy failed rctx=0x%p count=%u",
                                          entry.renderCtx, (uint32_t)remap.count);
-                                entry.renderCtx = nullptr;
+                                void* failedCtx = entry.renderCtx;
+                                for (auto& sibling : entries)
+                                {
+                                    if (sibling.renderCtx != failedCtx) continue;
+                                    sibling.renderCtx = nullptr;
+                                    sibling.boneRemap = {};
+                                }
                             }
                         }
                     }
@@ -2472,75 +2562,92 @@ namespace wxl::scripts::equipextension
     }
 
     // ─── OnBuildBonePalette ───────────────────────────────────────────────────────
-    // Fires POST-engine on every kBuildBonePalette call (one per M2 instance per frame).
-    // Only acts on collection models (initFlags & 0x40000): the engine does not drive their
-    // bone palette via parent transforms, so the outer scene-traversal at 0x821B4E fills them
-    // with T-pose, overwriting any CharSweep copy from the character's PerFrameUpdate.
-    // Re-applying here guarantees the copy is the last write before GPU upload.
+    // Re-apply the character remap after the engine's native palette build. ModelFrame clones do not fire
+    // equip-slot events, but preserve the shared collection/character model pair, so handle those too.
     void EquipExtension::OnBuildBonePalette(const ev::BuildBonePaletteArgs& a)
     {
-        if (g_attached.empty()) return;
+        if (g_attached.empty() || !a.renderCtx) return;
         void* renderCtx = a.renderCtx;
-
-        // Fast reject: only collection models need manual bone driving.
-        uint32_t initF = GuardedReadU32(
-            reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstInitFlags);
-        if (!(initF & 0x40000)) return;
+        void* childModel = GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstModel);
+        AttachEntry* cloneCandidate = nullptr;
+        void* clonePoseSource = nullptr;
 
         for (auto& [cmo, entries] : g_attached)
         {
+            void* charRctx = GuardedReadPtr(reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoSceneNode);
             for (auto& entry : entries)
             {
-                if (entry.renderCtx != renderCtx) continue;
-                if (entry.geoFilter.count == 0) continue;
-                if (entry.boneRemap.count == 0) continue;
-                void* charRctx = GuardedReadPtr(
-                    reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoSceneNode);
-                if (!charRctx) continue;
-                auto* charBuf = reinterpret_cast<uint8_t*>(
-                    GuardedReadPtr(reinterpret_cast<uint8_t*>(charRctx) + m2::kOffInstBonePalette));
-                if (!charBuf) continue;
-                auto* collBuf = reinterpret_cast<uint8_t*>(
-                    GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstBonePalette));
-                if (!collBuf) continue;
+                if (!IsCollectionEntry(entry)) continue;
+                if (entry.renderCtx != renderCtx)
+                {
+                    if (!cloneCandidate && childModel && BoneRemapHasMatch(entry.boneRemap) &&
+                        entry.boneRemap.collectionModel == childModel)
+                    {
+                        void* source = FindAncestorWithModelGuarded(renderCtx, entry.boneRemap.characterModel);
+                        if (source) { cloneCandidate = &entry; clonePoseSource = source; }
+                    }
+                    continue;
+                }
+
+                void* poseSource = FindAncestorWithModelGuarded(renderCtx, entry.boneRemap.characterModel);
+                if (!poseSource) poseSource = NativeParentGuarded(renderCtx);
+                if (!poseSource) poseSource = charRctx;
+                if (!poseSource || poseSource == renderCtx) return;
+
+                if (!BoneRemapMatchesContextsGuarded(entry.boneRemap, renderCtx, poseSource))
+                {
+                    BoneRemap rebuilt = BuildBoneRemapGuarded(renderCtx, poseSource);
+                    if (!BoneRemapHasMatch(rebuilt)) return;
+                    for (auto& sibling : entries)
+                        if (sibling.renderCtx == renderCtx) sibling.boneRemap = rebuilt;
+                }
+
                 const BoneRemap& remap = entry.boneRemap;
-
-                if (!entry.bbpLogDone)
+                auto* charBuf = reinterpret_cast<uint8_t*>(GuardedReadPtr(
+                    reinterpret_cast<uint8_t*>(poseSource) + m2::kOffInstBonePalette));
+                auto* collBuf = reinterpret_cast<uint8_t*>(GuardedReadPtr(
+                    reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstBonePalette));
+                if (!charBuf || !collBuf) return;
+                if (!CopyRemappedBonesGuarded(collBuf, RenderCtxBoneCountGuarded(renderCtx),
+                                              charBuf, RenderCtxBoneCountGuarded(poseSource),
+                                              remap, renderCtx, poseSource))
                 {
-                    uint32_t xff = 0;
-                    for (uint32_t bi = 0; bi < remap.count; ++bi)
-                        if (remap.collToChar[bi] == 0xFF) ++xff;
-                    float m00 = *reinterpret_cast<const float*>(charBuf); // [0,0] of char bone 0
-                    EquipLog("  OnBBP[first] collRctx=0x%p initF=0x%X count=%u xff=%u"
-                             " map0-7=[%u %u %u %u %u %u %u %u] charBuf[0][0]=%.4f",
-                             renderCtx, initF, (uint32_t)remap.count, xff,
-                             remap.count>0 ? (uint32_t)remap.collToChar[0] : 255u,
-                             remap.count>1 ? (uint32_t)remap.collToChar[1] : 255u,
-                             remap.count>2 ? (uint32_t)remap.collToChar[2] : 255u,
-                             remap.count>3 ? (uint32_t)remap.collToChar[3] : 255u,
-                             remap.count>4 ? (uint32_t)remap.collToChar[4] : 255u,
-                             remap.count>5 ? (uint32_t)remap.collToChar[5] : 255u,
-                             remap.count>6 ? (uint32_t)remap.collToChar[6] : 255u,
-                             remap.count>7 ? (uint32_t)remap.collToChar[7] : 255u,
-                             m00);
-                    entry.bbpLogDone = true;
+                    const bool stale = GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) +
+                                                      m2::kOffInstModel) != remap.collectionModel;
+                    for (auto& sibling : entries)
+                    {
+                        if (sibling.renderCtx != renderCtx) continue;
+                        sibling.boneRemap = {};
+                        if (stale) sibling.renderCtx = nullptr;
+                    }
                 }
-
-                if (!CopyRemappedBonesGuarded(collBuf, charBuf, remap))
-                {
-                    EquipLog("  OnBBP(copy): guarded copy failed rctx=0x%p count=%u",
-                             renderCtx, (uint32_t)remap.count);
-                    entry.renderCtx = nullptr;
-                }
-                return; // renderCtx is unique per (keyBuf,attachId,texBuf) group; one copy suffices
+                entry.bbpLogDone = true;
+                return;
             }
         }
+
+        if (!cloneCandidate || !clonePoseSource) return;
+        const BoneRemap& remap = cloneCandidate->boneRemap;
+        auto* charBuf = reinterpret_cast<uint8_t*>(GuardedReadPtr(
+            reinterpret_cast<uint8_t*>(clonePoseSource) + m2::kOffInstBonePalette));
+        auto* collBuf = reinterpret_cast<uint8_t*>(GuardedReadPtr(
+            reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstBonePalette));
+        if (!charBuf || !collBuf) return;
+        if (CopyRemappedBonesGuarded(collBuf, RenderCtxBoneCountGuarded(renderCtx),
+                                    charBuf, RenderCtxBoneCountGuarded(clonePoseSource),
+                                    remap, renderCtx, clonePoseSource))
+            cloneCandidate->cloneBbpLogDone = true;
     }
 
     // ─── Constructor ──────────────────────────────────────────────────────────────
 
     EquipExtension::EquipExtension()
     {
+        if (GetFileAttributesA("WarcraftXL_equip-extension.disable") != INVALID_FILE_ATTRIBUTES)
+        {
+            WLOG_WARN("equip-extension: disabled by client flag");
+            return;
+        }
         on<&EquipExtension::OnItemSlotChange>(ev::Event::OnItemSlotChange);
         on<&EquipExtension::OnItemSlotClear>(ev::Event::OnItemSlotClear);
         on<&EquipExtension::OnM2SkinFinalize>(ev::Event::OnM2SkinFinalize);
