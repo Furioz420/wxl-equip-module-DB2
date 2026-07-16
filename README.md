@@ -8,7 +8,7 @@ A [WarcraftXL](https://github.com/WarcraftXL/WarcraftXL) module that dramaticall
 
 - **WarcraftXL** installed in the WoW 3.3.5a client directory (`d3d9.dll` proxy + `WarcraftXL.dll`).
 - This module is compiled into `WarcraftXL.dll` automatically — no separate DLL is needed.
-- Optional WXL sidecar CSVs can be shipped loose or inside a client patch when DBC columns are not expressive enough.
+- `wxl-retail-db2` publishes DB2-derived retail attachments and material targeting when DBC columns are not expressive enough.
 
 ---
 
@@ -93,76 +93,15 @@ These columns work exactly as they did for Head and Shoulders. No format change 
 
 ---
 
-## Optional WXL sidecar CSVs
+## Retail DB2 item displays
 
-DBC still remains the primary source, but the module can also read sidecar CSVs when retail data needs more structure than `ItemDisplayInfo.dbc` provides.
+DBC remains authoritative. When a display is not sufficiently represented by the native row,
+`wxl-retail-db2` publishes structured model and material entries from the real retail DB2 graph. Collection
+geoset filters and material batch targets are derived from the referenced `.skin` files at startup.
 
-Sidecars are searched in:
-
-- `WXLItemDisplayModels.csv`
-- `DBFilesClient\WXLItemDisplayModels.csv`
-- `WXLItemDisplayModelMaterials.csv`
-- `DBFilesClient\WXLItemDisplayModelMaterials.csv`
-- the same `DBFilesClient\...` paths inside every `Data\*.MPQ` patch, including open-folder `.MPQ` patches
-
-Sidecar reads use the client file system first and then the game's IO layer, so packed MPQs and open `.MPQ` folders both work.
-
-### `WXLItemDisplayModels.csv`
-
-Adds structured model rows for a display ID. If at least one model sidecar row exists for a display, the DBC model lists for that display are skipped.
-
-Common columns:
-
-| Column | Meaning |
-|--------|---------|
-| `DisplayID` | ItemDisplayInfo ID. Required. |
-| `Slot` | Slot name or internal model slot index. Examples: `Head`, `Shoulder`, `Chest`, `Glove`, `8`. |
-| `Model` / `ModelStem` / `ModelName` | Model stem or path. Required. May include `:geosets`. |
-| `Texture` / `TextureStem` / `ModelTexture` | Optional model texture stem. |
-| `Folder` | Optional object component folder override, e.g. `Head`, `Shoulder`, `Collections`. |
-| `Geosets` | Optional comma-separated geoset filter. Overrides any `:geosets` suffix in `Model`. |
-| `Attach` | Optional explicit attachment ID. |
-| `SuffixPolicy` | `Exact`/`None`, `Retail`/`New`, `Legacy`/`Race`, or `DBC`/`Slot`. |
-| `TexturePolicy` | Same idea as `SuffixPolicy`, but for texture suffixing. |
-| `Flags` | Extra Icon2-style model flags ORed into the row. |
-
-### `WXLItemDisplayModelMaterials.csv`
-
-Applies model-specific material textures, including special retail layers that should not be packed into `ModelTexture_1/2`.
-
-Common columns:
-
-| Column | Meaning |
-|--------|---------|
-| `DisplayID` | ItemDisplayInfo ID. Required. |
-| `ModelIndex` | Retail model index or part index. |
-| `ModelColumn` | `ModelName_1`, `ModelName_2`, `1`, or `2`. |
-| `Model` | Optional model stem filter. |
-| `Layer` | Material layer index. Required. |
-| `TextureType` | Retail texture type for the material row. |
-| `Folder` | Optional object component folder for texture pathing. |
-| `Texture` | Texture stem, or `__hide__...` for intentional hidden material rows. Required. |
-| `SkinSectionIDs` / `BatchIndexes` | Source skin map information from the converter. |
-| `TargetSkinSectionIDs` / `TargetBatchIndexes` | Batches/geosets that should receive the material row. |
-| `TargetMode` | Targeting behavior, e.g. `SlotGeosets`, `SkinMapOnly`, `HideSlotGeosets`, or `None`. |
-
-Targeted material rows are applied to virtual collection models instead of globally replacing the model's main texture. This is important for retail glow/edgefade/extra-layer materials.
-
----
-
-## Converter scripts
-
-The `tools/dbc-converters/` folder contains the helper scripts used to generate WXL-compatible `ItemDisplayInfo.dbc`, `Item.dbc`, and the optional sidecar CSVs described above.
-
-Included scripts:
-
-- `tools/dbc-converters/itemdisplayinfo/ItemDisplayDBC.py`
-- `tools/dbc-converters/itemdisplayinfo/FinalizeRetailItemDisplayInfo.py`
-- `tools/dbc-converters/item/ItemDBC.py`
-- `tools/dbc-converters/item/CreateSQL.py`
-- `tools/dbc-converters/item/CleanSQL.py`
-
-See `tools/dbc-converters/README.md` for required input exports, generated outputs, and packaging notes. Generated CSVs, SQL dumps, DB2 files, listfiles, and conversion logs are intentionally not committed.
+The snapshot is immutable and atomically published after background indexing. If it is not ready during an
+early equipment rebuild, this module uses the normal DBC model lists and retries later. The former
+`WXLItemDisplayModels.csv` and `WXLItemDisplayModelMaterials.csv` sidecars are no longer read.
 
 ---
 
@@ -263,7 +202,8 @@ This is mostly meant to show of the various ways to use it, not how it is best t
 
 **Fix:** Clear `ModelName_1` and `ModelName_2` for any non-head/shoulder item that should not have an attached model. A cleanup script may be provided in a future release.
 
-**Sidecar priority:** A display with model sidecar rows uses those rows instead of the DBC model lists. Keep the sidecar complete for that display, or omit it and let the DBC row drive the item.
+**DB2 priority:** Native DBC rows remain authoritative. For a retail display in the published DB2 index, the
+structured DB2 attachment list replaces the DBC model list for that equipment rebuild.
 
 ---
 

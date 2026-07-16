@@ -34,6 +34,7 @@ namespace wxl::scripts::equipextension
      * @param geoCount    number of IDs
      * @param texPath     full BLP path for the texture slot (may be empty)
      * @param variantKey  optional logical-model discriminator for entries that must not share cache keys
+     * @param materialPatchSpec optional batch-scoped material texture patch plan
      * @return number of characters written (excluding null), or 0 on truncation
      */
     size_t VPathBuildKey(char* out, size_t outSz, void* cmo,
@@ -55,6 +56,7 @@ namespace wxl::scripts::equipextension
      * @param geoCount    number of IDs
      * @param texPath     full BLP path for the texture slot (may be empty)
      * @param variantKey  optional logical-model discriminator for entries that must not share cache keys
+     * @param materialPatchSpec optional batch-scoped material texture patch plan
      */
     bool VPathPopulate(void* cmo, const char* realMdxPath,
                        const uint16_t* geoIds, uint32_t geoCount,

@@ -24,6 +24,8 @@
 #include "offsets/engine/Io.hpp"
 #include "offsets/game/DB2.hpp"
 #include "offsets/game/M2.hpp"
+#include "runtime/LuaBindings.hpp"
+#include "runtime/db2/ItemDisplayIndex.hpp"
 
 #include <windows.h>
 
@@ -33,6 +35,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -44,16 +47,12 @@ namespace wxl::scripts::equipextension
     namespace db2  = wxl::offsets::game::db2;
     namespace gm2  = wxl::game::m2;
     using wxl::game::Native;
+    namespace itemdisplay = wxl::runtime::db2::itemdisplay;
+    using GeosetFilter = itemdisplay::GeosetFilter;
+    using SidecarModelEntry = itemdisplay::ModelEntry;
+    using SidecarMaterialEntry = itemdisplay::MaterialEntry;
 
     // ─── Data types ──────────────────────────────────────────────────────────────
-
-    // List of skinSectionIds to show. count == 0 means "show all" (no filter applied).
-    // WoW geoset IDs are two-part values (e.g. 1301 = group 13, option 01).
-    struct GeosetFilter
-    {
-        uint16_t ids[16];
-        uint32_t count;
-    };
 
     // Maps collection bone index → character bone index (0xFF = unmatched).
     // Built by 3-pass matching: (1a) key_bone_id raw scan, (1b) BoneIndicesByID LUT,
@@ -66,34 +65,6 @@ namespace wxl::scripts::equipextension
         uint8_t  collToChar[256];
         void*    collectionModel;
         void*    characterModel;
-    };
-
-    struct SidecarModelEntry
-    {
-        uint32_t modelSlot    = static_cast<uint32_t>(-1);
-        uint32_t attachId     = static_cast<uint32_t>(-1);
-        uint32_t modelFlags   = 0x2 | 0x4; // exact path unless the sidecar asks for race/gender suffixes
-        uint32_t textureFlags = 0;
-        char     folder[32]   = {};
-        char     model[264]   = {};
-        char     texture[264] = {};
-        GeosetFilter geoFilter = {};
-    };
-
-    struct SidecarMaterialEntry
-    {
-        uint32_t modelIndex  = static_cast<uint32_t>(-1);
-        uint32_t modelColumn = static_cast<uint32_t>(-1);
-        uint32_t layer       = static_cast<uint32_t>(-1);
-        uint32_t textureType = static_cast<uint32_t>(-1);
-        char     folder[32]  = {};
-        char     model[264]  = {};
-        char     texture[264] = {};
-        char     skinSectionIds[256] = {};
-        char     batchIndexes[256] = {};
-        char     targetSkinSectionIds[256] = {};
-        char     targetBatchIndexes[256] = {};
-        char     targetMode[32] = {};
     };
 
     // One attachment entry per attached M2. Keyed by CharModelObject pointer in g_attached.
@@ -121,9 +92,40 @@ namespace wxl::scripts::equipextension
     // cmo (CharModelObject*) → attached M2 entries for that character
     static std::unordered_map<void*, std::vector<AttachEntry>> g_attached;
 
-    static bool g_sidecarLoaded = false;
-    static std::unordered_map<uint32_t, std::vector<SidecarModelEntry>> g_sidecarModels;
-    static std::unordered_map<uint32_t, std::vector<SidecarMaterialEntry>> g_sidecarMaterials;
+    static std::shared_ptr<const itemdisplay::Index> g_itemDisplayIndex;
+    static std::shared_ptr<const itemdisplay::Index> g_refreshedItemDisplayIndex;
+    static bool g_modelFrameRefreshPending = false;
+    static bool g_itemDisplayIndexWaitLogged = false;
+    struct PendingDb2Slot
+    {
+        void* cmo = nullptr;
+        uint32_t modelSlot = static_cast<uint32_t>(-1);
+        uint32_t displayId = 0;
+    };
+    static std::vector<PendingDb2Slot> g_pendingDb2Slots;
+
+    static void ForgetPendingDb2Slot(void* cmo, uint32_t modelSlot)
+    {
+        for (size_t i = 0; i < g_pendingDb2Slots.size(); )
+        {
+            if (g_pendingDb2Slots[i].cmo == cmo && g_pendingDb2Slots[i].modelSlot == modelSlot)
+                g_pendingDb2Slots.erase(g_pendingDb2Slots.begin() + static_cast<ptrdiff_t>(i));
+            else
+                ++i;
+        }
+    }
+
+    static void RememberPendingDb2Slot(void* cmo, uint32_t modelSlot, uint32_t displayId)
+    {
+        if (!cmo || modelSlot >= 11 || !displayId) return;
+        for (PendingDb2Slot& pending : g_pendingDb2Slots)
+        {
+            if (pending.cmo != cmo || pending.modelSlot != modelSlot) continue;
+            pending.displayId = displayId;
+            return;
+        }
+        g_pendingDb2Slots.push_back({cmo, modelSlot, displayId});
+    }
 
     // Set to the cmo being processed in RebuildAllModels Phase1. OnM2SkinFinalize uses
     // this to apply the filter during a synchronous load that fires kFinalizeSkin inside
@@ -152,8 +154,8 @@ namespace wxl::scripts::equipextension
         { "Foot",     47,  48, false, false }, // 6  FEET
         { "Bracer",    3,   4, false, false }, // 7  WRIST
         { "Glove",     1,   2, false, false }, // 8  HAND
-        { "Cape",     12,  12, false, false }, // 9  BACK
-        { "Tabard",   34,  34, false, false }, // 10 TABARD
+        { "Tabard",   34,  34, false, false }, // 9  TABARD
+        { "Cape",     12,  12, false, false }, // 10 BACK
     };
     constexpr uint32_t kCollectionAttach = 19;
     constexpr uint32_t kFlagForceModelRaceGender = 0x80;
@@ -174,11 +176,11 @@ namespace wxl::scripts::equipextension
         static_cast<uint32_t>(-1), // 11 deferred
         static_cast<uint32_t>(-1), // 12 deferred
         static_cast<uint32_t>(-1), // 13 deferred
-        9,                       // 14 BACK
+        10,                      // 14 BACK
         static_cast<uint32_t>(-1), // 15 deferred (weapons)
         static_cast<uint32_t>(-1), // 16 deferred (weapons)
         static_cast<uint32_t>(-1), // 17 deferred (weapons)
-        10,                      // 18 TABARD
+        9,                       // 18 TABARD
     };
 
     // ─── Debug logging ───────────────────────────────────────────────────────────
@@ -206,8 +208,13 @@ namespace wxl::scripts::equipextension
             char env[16] = {};
             const DWORD n = GetEnvironmentVariableA("WXL_EQUIP_BONE_COPY", env, sizeof(env));
             if (n > 0 && (env[0] == '0' || env[0] == 'n' || env[0] == 'N' ||
-                          env[0] == 'f' || env[0] == 'F')) return 0;
-            return GetFileAttributesA("WarcraftXL_equip_bone_copy.disable") == INVALID_FILE_ATTRIBUTES ? 1 : 0;
+                          env[0] == 'f' || env[0] == 'F'))
+                return 0;
+
+            return GetFileAttributesA("WarcraftXL_equip_bone_copy.disable") ==
+                           INVALID_FILE_ATTRIBUTES
+                       ? 1
+                       : 0;
         }();
         return enabled != 0;
     }
@@ -260,21 +267,29 @@ namespace wxl::scripts::equipextension
     static void* NativeParentGuarded(void* instance) noexcept
     {
         if (!instance) return nullptr;
-        void* parent = GuardedReadPtr(reinterpret_cast<uint8_t*>(instance) + m2::kOffInstParent);
+        void* parent = GuardedReadPtr(
+            reinterpret_cast<uint8_t*>(instance) + m2::kOffInstParent);
         return parent != instance ? parent : nullptr;
     }
 
+    // Locate the character instance inside a duplicated/parented M2 tree by shared-model identity.
+    // We deliberately do not choose the absolute root: a character can itself be attached to a
+    // mount or vehicle, while the collection mesh still needs the character's bone palette.
     static void* FindAncestorWithModelGuarded(void* instance, void* wantedModel) noexcept
     {
         if (!instance || !wantedModel) return nullptr;
+
         void* seen[32] = {};
         void* current = NativeParentGuarded(instance);
         for (uint32_t depth = 0; depth < 32; ++depth)
         {
             if (!current) return nullptr;
-            for (uint32_t i = 0; i < depth; ++i) if (seen[i] == current) return nullptr;
+            for (uint32_t i = 0; i < depth; ++i)
+                if (seen[i] == current) return nullptr;
             seen[depth] = current;
-            if (GuardedReadPtr(reinterpret_cast<uint8_t*>(current) + m2::kOffInstModel) == wantedModel)
+
+            if (GuardedReadPtr(reinterpret_cast<uint8_t*>(current) + m2::kOffInstModel) ==
+                wantedModel)
                 return current;
             current = NativeParentGuarded(current);
         }
@@ -284,17 +299,23 @@ namespace wxl::scripts::equipextension
     static bool BoneRemapHasMatch(const BoneRemap& remap) noexcept
     {
         if (remap.count == 0 || remap.count > 256) return false;
-        for (uint32_t i = 0; i < remap.count; ++i) if (remap.collToChar[i] != 0xFF) return true;
+        for (uint32_t i = 0; i < remap.count; ++i)
+            if (remap.collToChar[i] != 0xFF) return true;
         return false;
     }
 
-    static bool BoneRemapMatchesContextsGuarded(const BoneRemap& remap, void* collectionCtx,
+    static bool BoneRemapMatchesContextsGuarded(const BoneRemap& remap,
+                                                void* collectionCtx,
                                                 void* characterCtx) noexcept
     {
-        if (!BoneRemapHasMatch(remap) || !collectionCtx || !characterCtx || collectionCtx == characterCtx ||
-            !remap.collectionModel || !remap.characterModel) return false;
-        return GuardedReadPtr(reinterpret_cast<uint8_t*>(collectionCtx) + m2::kOffInstModel) == remap.collectionModel &&
-               GuardedReadPtr(reinterpret_cast<uint8_t*>(characterCtx) + m2::kOffInstModel) == remap.characterModel;
+        if (!BoneRemapHasMatch(remap) || !collectionCtx || !characterCtx ||
+            collectionCtx == characterCtx || !remap.collectionModel || !remap.characterModel)
+            return false;
+
+        return GuardedReadPtr(reinterpret_cast<uint8_t*>(collectionCtx) + m2::kOffInstModel) ==
+                   remap.collectionModel &&
+               GuardedReadPtr(reinterpret_cast<uint8_t*>(characterCtx) + m2::kOffInstModel) ==
+                   remap.characterModel;
     }
 
     static uint32_t RenderCtxBoneCountGuarded(void* renderCtx) noexcept
@@ -302,9 +323,11 @@ namespace wxl::scripts::equipextension
         if (!renderCtx) return 0;
         __try
         {
-            void* model = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstModel);
+            void* model = *reinterpret_cast<void**>(
+                reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstModel);
             if (!model) return 0;
-            auto* header = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(model) + m2::kOffModelHeader);
+            auto* header = *reinterpret_cast<uint8_t**>(
+                reinterpret_cast<uint8_t*>(model) + m2::kOffModelHeader);
             if (!header) return 0;
             const uint32_t count = *reinterpret_cast<uint32_t*>(header + m2::kOffHdrBoneCount);
             return count <= 256 ? count : 0;
@@ -312,9 +335,12 @@ namespace wxl::scripts::equipextension
         __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
     }
 
-    static bool CopyRemappedBonesGuarded(uint8_t* dstBuf, uint32_t dstBoneCount,
-                                         const uint8_t* srcBuf, uint32_t srcBoneCount,
-                                         const BoneRemap& remap, void* dstRenderCtx,
+    static bool CopyRemappedBonesGuarded(uint8_t* dstBuf,
+                                         uint32_t dstBoneCount,
+                                         const uint8_t* srcBuf,
+                                         uint32_t srcBoneCount,
+                                         const BoneRemap& remap,
+                                         void* dstRenderCtx,
                                          void* srcRenderCtx) noexcept
     {
         if (!BoneCopyEnabled())
@@ -327,12 +353,21 @@ namespace wxl::scripts::equipextension
             }
             return true;
         }
+
+        // The palette is allocated as modelBoneCount * 0x40 by sub_833030. A stale render-context
+        // address can be recycled for a smaller model while g_attached still holds the old remap;
+        // the old blanket memcpy loop then writes beyond that new palette and corrupts the heap.
+        // Require the live destination model to have the exact count the remap was built for and
+        // independently bound every source index to the live character model.
         if (!dstBuf || !srcBuf || dstBuf == srcBuf || !dstRenderCtx || !srcRenderCtx ||
-            remap.count == 0 || remap.count > 256 || dstBoneCount == 0 || srcBoneCount == 0 ||
+            remap.count == 0 || remap.count > 256 ||
+            dstBoneCount == 0 || srcBoneCount == 0 ||
             remap.count != dstBoneCount || srcBoneCount > 256 ||
             !remap.collectionModel || !remap.characterModel ||
-            GuardedReadPtr(reinterpret_cast<uint8_t*>(dstRenderCtx) + m2::kOffInstModel) != remap.collectionModel ||
-            GuardedReadPtr(reinterpret_cast<uint8_t*>(srcRenderCtx) + m2::kOffInstModel) != remap.characterModel)
+            GuardedReadPtr(reinterpret_cast<uint8_t*>(dstRenderCtx) + m2::kOffInstModel) !=
+                remap.collectionModel ||
+            GuardedReadPtr(reinterpret_cast<uint8_t*>(srcRenderCtx) + m2::kOffInstModel) !=
+                remap.characterModel)
             return false;
 
         __try
@@ -451,7 +486,9 @@ namespace wxl::scripts::equipextension
                 }
             }
 
-            // Accessory chains in paper-doll collection models can be deeper than eight bones.
+            // Pass 2: propagate matched values down unmatched parent chains. Paper-doll collection
+            // models can contain accessory chains deeper than eight bones (capes are a common case),
+            // so use the model's own bone count as the convergence bound.
             for (uint32_t pass = 0; pass < collN; ++pass)
             {
                 bool changed = false;
@@ -538,120 +575,8 @@ namespace wxl::scripts::equipextension
         return false;
     }
 
-    static void CopyString(char* out, size_t outSz, const char* value) noexcept
-    {
-        if (!out || outSz == 0) return;
-        out[0] = '\0';
-        if (!value) return;
-        std::strncpy(out, value, outSz - 1);
-        out[outSz - 1] = '\0';
-    }
-
-    static std::string TrimCopy(std::string value)
-    {
-        size_t first = 0;
-        while (first < value.size() && (value[first] == ' ' || value[first] == '\t')) ++first;
-        size_t last = value.size();
-        while (last > first)
-        {
-            const char c = value[last - 1];
-            if (c != ' ' && c != '\t' && c != '\r' && c != '\n') break;
-            --last;
-        }
-        return value.substr(first, last - first);
-    }
-
-    static std::string NormalizeCsvName(const std::string& value)
-    {
-        std::string out;
-        out.reserve(value.size());
-        for (char c : value)
-        {
-            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) out.push_back(c);
-        }
-        return out;
-    }
-
-    static std::vector<std::string> ParseCsvLine(const char* line)
-    {
-        std::vector<std::string> fields;
-        std::string field;
-        bool quoted = false;
-        for (const char* p = line; *p; ++p)
-        {
-            char c = *p;
-            if (c == '\r' || c == '\n')
-            {
-                if (!quoted) break;
-            }
-            if (quoted)
-            {
-                if (c == '"')
-                {
-                    if (p[1] == '"') { field.push_back('"'); ++p; }
-                    else quoted = false;
-                }
-                else field.push_back(c);
-            }
-            else
-            {
-                if (c == '"') quoted = true;
-                else if (c == ',') { fields.push_back(TrimCopy(field)); field.clear(); }
-                else field.push_back(c);
-            }
-        }
-        fields.push_back(TrimCopy(field));
-        return fields;
-    }
-
-    static int FindCsvColumn(const std::vector<std::string>& header, const char* name)
-    {
-        const std::string wanted = NormalizeCsvName(name);
-        for (size_t i = 0; i < header.size(); ++i)
-            if (NormalizeCsvName(header[i]) == wanted)
-                return static_cast<int>(i);
-        return -1;
-    }
-
-    static const char* CsvField(const std::vector<std::string>& row, int column) noexcept
-    {
-        if (column < 0 || static_cast<size_t>(column) >= row.size()) return "";
-        return row[static_cast<size_t>(column)].c_str();
-    }
-
-    static bool ParseU32(const char* text, uint32_t* out) noexcept
-    {
-        if (!text || !*text || !out) return false;
-        char* end = nullptr;
-        unsigned long value = std::strtoul(text, &end, 10);
-        if (end == text) return false;
-        *out = static_cast<uint32_t>(value);
-        return true;
-    }
-
     static bool StartsWithCI(const char* s, const char* prefix) noexcept;
     static bool ContainsCI(const char* s, const char* needle) noexcept;
-
-    static uint32_t ParseModelColumn(const char* value) noexcept
-    {
-        if (!value || !*value) return static_cast<uint32_t>(-1);
-        uint32_t numeric = 0;
-        if (ParseU32(value, &numeric))
-        {
-            if (numeric == 0 || numeric == 1) return numeric;
-            if (numeric == 2) return 1;
-            return static_cast<uint32_t>(-1);
-        }
-
-        if (ContainsCI(value, "ModelName_1") || ContainsCI(value, "ModelTexture_1") ||
-            ContainsCI(value, "Model_1") || ContainsCI(value, "Texture_1"))
-            return 0;
-        if (ContainsCI(value, "ModelName_2") || ContainsCI(value, "ModelTexture_2") ||
-            ContainsCI(value, "Model_2") || ContainsCI(value, "Texture_2"))
-            return 1;
-        return static_cast<uint32_t>(-1);
-    }
 
     static void NormalizedStemKey(const char* value, char* out, size_t outSz) noexcept
     {
@@ -687,50 +612,6 @@ namespace wxl::scripts::equipextension
         NormalizedStemKey(sidecarModel, a, sizeof(a));
         NormalizedStemKey(model, b, sizeof(b));
         return a[0] && b[0] && std::strcmp(a, b) == 0;
-    }
-
-    static uint32_t ParseSidecarSlot(const char* slot) noexcept
-    {
-        if (!slot || !*slot) return static_cast<uint32_t>(-1);
-        uint32_t numeric = 0;
-        if (ParseU32(slot, &numeric) && numeric < 11) return numeric;
-
-        if (StartsWithCI(slot, "Head")) return 0;
-        if (StartsWithCI(slot, "Shoulder")) return 1;
-        if (StartsWithCI(slot, "Shirt")) return 2;
-        if (StartsWithCI(slot, "Chest") || StartsWithCI(slot, "Robe")) return 3;
-        if (StartsWithCI(slot, "Waist") || StartsWithCI(slot, "Belt")) return 4;
-        if (StartsWithCI(slot, "Leg") || StartsWithCI(slot, "Pant")) return 5;
-        if (StartsWithCI(slot, "Foot") || StartsWithCI(slot, "Feet") || StartsWithCI(slot, "Boot")) return 6;
-        if (StartsWithCI(slot, "Bracer") || StartsWithCI(slot, "Wrist")) return 7;
-        if (StartsWithCI(slot, "Glove") || StartsWithCI(slot, "Hand")) return 8;
-        if (StartsWithCI(slot, "Cape") || StartsWithCI(slot, "Back") || StartsWithCI(slot, "Cloak")) return 9;
-        if (StartsWithCI(slot, "Tabard")) return 10;
-        return static_cast<uint32_t>(-1);
-    }
-
-    static uint32_t ModelFlagsForSuffixPolicy(const char* policy) noexcept
-    {
-        if (policy && (StartsWithCI(policy, "DBC") || StartsWithCI(policy, "Slot"))) return 0xffffffffu;
-        if (!policy || !*policy || StartsWithCI(policy, "Exact")) return 0x2 | 0x4;
-        if (StartsWithCI(policy, "None")) return 0x2 | 0x4;
-        if (StartsWithCI(policy, "Retail")) return 0x40;
-        if (StartsWithCI(policy, "New")) return 0x40;
-        if (StartsWithCI(policy, "Legacy")) return 0;
-        if (StartsWithCI(policy, "Race")) return 0;
-        return 0x2 | 0x4;
-    }
-
-    static uint32_t TextureFlagsForPolicy(const char* policy) noexcept
-    {
-        if (policy && (StartsWithCI(policy, "DBC") || StartsWithCI(policy, "Slot"))) return 0xffffffffu;
-        if (!policy || !*policy || StartsWithCI(policy, "Exact")) return 0;
-        if (StartsWithCI(policy, "None")) return 0;
-        if (StartsWithCI(policy, "Retail")) return 0x8 | 0x10 | 0x40;
-        if (StartsWithCI(policy, "New")) return 0x8 | 0x10 | 0x40;
-        if (StartsWithCI(policy, "Legacy")) return 0x8 | 0x10;
-        if (StartsWithCI(policy, "Race")) return 0x8 | 0x10;
-        return 0;
     }
 
     static void ParseAttachField(const char* start, const char* end,
@@ -911,8 +792,8 @@ namespace wxl::scripts::equipextension
             case 0:  // Head
             case 1:  // Shoulder
             case 4:  // Waist / 3D belts
-            case 9:  // Back/cape
-            case 10: // Tabard
+            case 9:  // Tabard
+            case 10: // Back/cape
                 return true;
             default:
                 return false;
@@ -961,214 +842,28 @@ namespace wxl::scripts::equipextension
         }
     }
 
-    static bool ReadSidecarLines(const char* path, std::vector<std::string>& lines)
+    static bool LoadSidecarModels()
     {
-        lines.clear();
-        if (!path || !*path) return false;
-
-        if (FILE* f = std::fopen(path, "rb"))
+        const auto current = itemdisplay::Current();
+        if (!current)
         {
-            char line[4096];
-            while (std::fgets(line, sizeof(line), f))
-                lines.emplace_back(line);
-            std::fclose(f);
-            return !lines.empty();
-        }
-
-        namespace io    = wxl::game::io;
-        namespace iooff = wxl::offsets::engine::io;
-
-        void* handle = nullptr;
-        if (!io::FileOpen(path, iooff::kOpenWholeFile, &handle) || !handle)
+            if (!g_itemDisplayIndexWaitLogged)
+            {
+                EquipLog("DB2 item-display index is still building; using DBC models for this rebuild");
+                g_itemDisplayIndexWaitLogged = true;
+            }
             return false;
-
-        uint32_t sizeHigh = 0;
-        const uint32_t size = io::FileSize(handle, &sizeHigh);
-        std::string bytes;
-        bool ok = false;
-        if (size > 0 && sizeHigh == 0)
-        {
-            bytes.resize(size);
-            uint32_t got = 0;
-            io::FileRead(handle, &bytes[0], size, &got);
-            ok = (got == size);
-        }
-        io::FileClose(handle);
-        if (!ok) return false;
-
-        size_t start = 0;
-        for (size_t i = 0; i <= bytes.size(); ++i)
-        {
-            if (i != bytes.size() && bytes[i] != '\n') continue;
-            std::string line = bytes.substr(start, i - start);
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            lines.push_back(line);
-            start = i + 1;
-        }
-        return !lines.empty();
-    }
-
-    static void LoadSidecarFile(const char* path)
-    {
-        std::vector<std::string> lines;
-        if (!ReadSidecarLines(path, lines)) return;
-
-        const std::vector<std::string> header = ParseCsvLine(lines[0].c_str());
-        const int cDisplay = FindCsvColumn(header, "DisplayID");
-        const int cSlot = FindCsvColumn(header, "Slot");
-        int cModel = FindCsvColumn(header, "Model");
-        if (cModel < 0) cModel = FindCsvColumn(header, "ModelStem");
-        if (cModel < 0) cModel = FindCsvColumn(header, "ModelName");
-        int cTexture = FindCsvColumn(header, "Texture");
-        if (cTexture < 0) cTexture = FindCsvColumn(header, "TextureStem");
-        if (cTexture < 0) cTexture = FindCsvColumn(header, "ModelTexture");
-        const int cFolder = FindCsvColumn(header, "Folder");
-        const int cGeosets = FindCsvColumn(header, "Geosets");
-        const int cAttach = FindCsvColumn(header, "Attach");
-        const int cSuffixPolicy = FindCsvColumn(header, "SuffixPolicy");
-        const int cTexturePolicy = FindCsvColumn(header, "TexturePolicy");
-        const int cFlags = FindCsvColumn(header, "Flags");
-
-        if (cDisplay < 0 || cModel < 0)
-        {
-            EquipLog("sidecar '%s': missing DisplayID or Model column", path);
-            return;
         }
 
-        uint32_t loaded = 0;
-        for (size_t lineIndex = 1; lineIndex < lines.size(); ++lineIndex)
+        if (current != g_itemDisplayIndex)
         {
-            if (lines[lineIndex].empty()) continue;
-            const std::vector<std::string> row = ParseCsvLine(lines[lineIndex].c_str());
-            uint32_t displayId = 0;
-            if (!ParseU32(CsvField(row, cDisplay), &displayId) || displayId == 0) continue;
-
-            SidecarModelEntry e = {};
-            e.modelSlot = ParseSidecarSlot(CsvField(row, cSlot));
-            e.modelFlags = ModelFlagsForSuffixPolicy(CsvField(row, cSuffixPolicy));
-            e.textureFlags = TextureFlagsForPolicy(CsvField(row, cTexturePolicy));
-
-            uint32_t attach = static_cast<uint32_t>(-1);
-            if (ParseU32(CsvField(row, cAttach), &attach)) e.attachId = attach;
-
-            uint32_t extraFlags = 0;
-            if (ParseU32(CsvField(row, cFlags), &extraFlags)) e.modelFlags |= extraFlags;
-
-            CopyString(e.folder, sizeof(e.folder), CsvField(row, cFolder));
-            CopyString(e.model, sizeof(e.model), CsvField(row, cModel));
-            CopyString(e.texture, sizeof(e.texture), CsvField(row, cTexture));
-
-            char* colon = std::strchr(e.model, ':');
-            if (colon)
-            {
-                *colon = '\0';
-                e.geoFilter = ParseGeosetFilter(colon + 1);
-            }
-            const char* geosets = CsvField(row, cGeosets);
-            if (geosets && *geosets) e.geoFilter = ParseGeosetFilter(geosets);
-            if (!e.model[0]) continue;
-
-            g_sidecarModels[displayId].push_back(e);
-            ++loaded;
+            g_itemDisplayIndex = current;
+            g_itemDisplayIndexWaitLogged = false;
+            EquipLog("DB2 item-display index phase ready: displays=%zu materialDisplays=%zu materialsReady=%u",
+                     g_itemDisplayIndex->models.size(), g_itemDisplayIndex->materials.size(),
+                     g_itemDisplayIndex->materialsReady ? 1u : 0u);
         }
-
-        if (loaded)
-            EquipLog("sidecar loaded '%s' rows=%u", path, loaded);
-    }
-
-    static void LoadMaterialSidecarFile(const char* path)
-    {
-        std::vector<std::string> lines;
-        if (!ReadSidecarLines(path, lines)) return;
-
-        const std::vector<std::string> header = ParseCsvLine(lines[0].c_str());
-        const int cDisplay = FindCsvColumn(header, "DisplayID");
-        const int cModelIndex = FindCsvColumn(header, "ModelIndex");
-        const int cModelColumn = FindCsvColumn(header, "ModelColumn");
-        const int cModel = FindCsvColumn(header, "Model");
-        const int cLayer = FindCsvColumn(header, "Layer");
-        const int cTextureType = FindCsvColumn(header, "TextureType");
-        const int cFolder = FindCsvColumn(header, "Folder");
-        const int cTexture = FindCsvColumn(header, "Texture");
-        const int cSkinSectionIds = FindCsvColumn(header, "SkinSectionIDs");
-        const int cBatchIndexes = FindCsvColumn(header, "BatchIndexes");
-        const int cTargetSkinSectionIds = FindCsvColumn(header, "TargetSkinSectionIDs");
-        const int cTargetBatchIndexes = FindCsvColumn(header, "TargetBatchIndexes");
-        const int cTargetMode = FindCsvColumn(header, "TargetMode");
-
-        if (cDisplay < 0 || cLayer < 0 || cTexture < 0)
-        {
-            EquipLog("material sidecar '%s': missing DisplayID, Layer, or Texture column", path);
-            return;
-        }
-
-        uint32_t loaded = 0;
-        for (size_t lineIndex = 1; lineIndex < lines.size(); ++lineIndex)
-        {
-            if (lines[lineIndex].empty()) continue;
-            const std::vector<std::string> row = ParseCsvLine(lines[lineIndex].c_str());
-            uint32_t displayId = 0;
-            if (!ParseU32(CsvField(row, cDisplay), &displayId) || displayId == 0) continue;
-
-            SidecarMaterialEntry e = {};
-            ParseU32(CsvField(row, cModelIndex), &e.modelIndex);
-            e.modelColumn = ParseModelColumn(CsvField(row, cModelColumn));
-            if (e.modelColumn == static_cast<uint32_t>(-1))
-                e.modelColumn = ParseModelColumn(CsvField(row, cModelIndex));
-            if (!ParseU32(CsvField(row, cLayer), &e.layer) || e.layer > 15) continue;
-            if (cTextureType >= 0)
-                ParseU32(CsvField(row, cTextureType), &e.textureType);
-
-            CopyString(e.folder, sizeof(e.folder), CsvField(row, cFolder));
-            CopyString(e.model, sizeof(e.model), CsvField(row, cModel));
-            CopyString(e.texture, sizeof(e.texture), CsvField(row, cTexture));
-            CopyString(e.skinSectionIds, sizeof(e.skinSectionIds), CsvField(row, cSkinSectionIds));
-            CopyString(e.batchIndexes, sizeof(e.batchIndexes), CsvField(row, cBatchIndexes));
-            CopyString(e.targetSkinSectionIds, sizeof(e.targetSkinSectionIds), CsvField(row, cTargetSkinSectionIds));
-            CopyString(e.targetBatchIndexes, sizeof(e.targetBatchIndexes), CsvField(row, cTargetBatchIndexes));
-            CopyString(e.targetMode, sizeof(e.targetMode), CsvField(row, cTargetMode));
-            if (!e.texture[0]) continue;
-
-            g_sidecarMaterials[displayId].push_back(e);
-            ++loaded;
-        }
-
-        if (loaded)
-            EquipLog("material sidecar loaded '%s' rows=%u", path, loaded);
-    }
-
-    static void LoadSidecarModels()
-    {
-        if (g_sidecarLoaded) return;
-        g_sidecarLoaded = true;
-
-        LoadSidecarFile("WXLItemDisplayModels.csv");
-        LoadSidecarFile("DBFilesClient\\WXLItemDisplayModels.csv");
-        LoadMaterialSidecarFile("WXLItemDisplayModelMaterials.csv");
-        LoadMaterialSidecarFile("DBFilesClient\\WXLItemDisplayModelMaterials.csv");
-
-        WIN32_FIND_DATAA fd = {};
-        HANDLE h = FindFirstFileA("Data\\*.MPQ", &fd);
-        if (h != INVALID_HANDLE_VALUE)
-        {
-            do
-            {
-                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-                std::string path = "Data\\";
-                path += fd.cFileName;
-                path += "\\DBFilesClient\\WXLItemDisplayModels.csv";
-                LoadSidecarFile(path.c_str());
-                path = "Data\\";
-                path += fd.cFileName;
-                path += "\\DBFilesClient\\WXLItemDisplayModelMaterials.csv";
-                LoadMaterialSidecarFile(path.c_str());
-            }
-            while (FindNextFileA(h, &fd));
-            FindClose(h);
-        }
-
-        EquipLog("sidecar table ready: displays=%zu materialDisplays=%zu",
-                 g_sidecarModels.size(), g_sidecarMaterials.size());
+        return true;
     }
 
     // ─── Path builders ────────────────────────────────────────────────────────────
@@ -1331,8 +1026,9 @@ namespace wxl::scripts::equipextension
                                         const char* slotFolder,
                                         bool isCollection) noexcept
     {
-        auto it = g_sidecarMaterials.find(displayId);
-        if (it == g_sidecarMaterials.end()) return false;
+        if (!LoadSidecarModels()) return false;
+        auto it = g_itemDisplayIndex->materials.find(displayId);
+        if (it == g_itemDisplayIndex->materials.end()) return false;
         for (const SidecarMaterialEntry& m : it->second)
         {
             if (!MaterialEntryMatches(m, modelColumn, partIndex, modelName)) continue;
@@ -1368,8 +1064,9 @@ namespace wxl::scripts::equipextension
         if (!out || outSz == 0) return;
         out[0] = '\0';
 
-        auto it = g_sidecarMaterials.find(displayId);
-        if (it == g_sidecarMaterials.end()) return;
+        if (!LoadSidecarModels()) return;
+        auto it = g_itemDisplayIndex->materials.find(displayId);
+        if (it == g_itemDisplayIndex->materials.end()) return;
         if (!HasTargetedMaterialRows(displayId, modelColumn, partIndex, modelName,
                                      slotFolder, isCollection)) return;
 
@@ -1515,7 +1212,10 @@ namespace wxl::scripts::equipextension
         for (uint32_t k = 0; k < nPairs; ++k)
             gm2::DetachSlot(pairs[k].subObj, pairs[k].attachId);
 
-        if (vec.empty()) g_attached.erase(it);
+        if (vec.empty())
+        {
+            g_attached.erase(it);
+        }
     }
 
     // Detaches all unique attach_ids in g_attached[cmo], then re-attaches each unique
@@ -1543,7 +1243,8 @@ namespace wxl::scripts::equipextension
         EquipLog("  RebuildAllModels: %zu entries, subObj=0x%p owner28=0x%p",
                  entries.size(), subObj, owner28);
 
-        // Reset all state tied to the previous render context.
+        // Reset all state tied to the previous render context. Keeping an old remap while replacing
+        // the context can make a same-sized but unrelated model look valid to count-only checks.
         for (auto& e : entries)
         {
             e.renderCtx = nullptr;
@@ -1731,6 +1432,8 @@ namespace wxl::scripts::equipextension
                      i, e.attachId, rctx, subInitFlags, (int)isCollection);
             gm2::AttachToScene(rctx, subObj, e.attachId, isCollection);
 
+            // The known CMO scene node is the character pose source here. Record the native link
+            // as a diagnostic; it should be identical immediately after AttachToParent.
             void* nativeParent = NativeParentGuarded(rctx);
             BoneRemap remap = BuildBoneRemapGuarded(rctx, subObj);
             EquipLog("  Phase3[%zu] boneRemap.count=%u requestedParent=0x%p nativeParent=0x%p",
@@ -1808,11 +1511,16 @@ namespace wxl::scripts::equipextension
 
         if (displayId == 0)
         {
+            ForgetPendingDb2Slot(cmo, a.modelSlot);
             EquipLog("  unequip: detach+rebuild");
             DetachSlotEntries(cmo, a.modelSlot);
             if (subObj) RebuildAllModels(cmo);
             return;
         }
+
+        // Keep live slots registered across both DB2 publication phases. Glue character models and
+        // CharacterModelFrame frequently receive their slot events before even the fast model phase.
+        RememberPendingDb2Slot(cmo, a.modelSlot, displayId);
 
         // Look up the ItemDisplayInfo record.
         alignas(4) uint8_t dispBuf[db2::itemdisplayinfo::kRecordSize] = {};
@@ -1831,12 +1539,14 @@ namespace wxl::scripts::equipextension
             texName1   = *reinterpret_cast<const char**>(dispBuf + db2::itemdisplayinfo::kOffTex1);
             texName2   = *reinterpret_cast<const char**>(dispBuf + db2::itemdisplayinfo::kOffTex2);
             icon2str   = *reinterpret_cast<const char**>(dispBuf + db2::itemdisplayinfo::kOffIcon2);
+
             EquipLog("  DBC ok: model1='%s' model2='%s' tex1='%s' tex2='%s' icon2ptr=0x%p icon2='%s'",
-                     modelName1 ? modelName1 : "(null)", modelName2 ? modelName2 : "(null)",
-                     texName1 ? texName1 : "(null)", texName2 ? texName2 : "(null)",
+                     modelName1 ? modelName1 : "(null)",
+                     modelName2 ? modelName2 : "(null)",
+                     texName1   ? texName1   : "(null)",
+                     texName2   ? texName2   : "(null)",
                      static_cast<const void*>(icon2str),
-                     (icon2str && reinterpret_cast<uintptr_t>(icon2str) > 0x10000 && *icon2str)
-                         ? icon2str : "(empty/invalid)");
+                     (icon2str && reinterpret_cast<uintptr_t>(icon2str) > 0x10000 && *icon2str) ? icon2str : "(empty/invalid)");
         }
         else
         {
@@ -2047,9 +1757,13 @@ namespace wxl::scripts::equipextension
 
         auto addSidecarModels = [&]() -> bool
         {
-            LoadSidecarModels();
-            auto it = g_sidecarModels.find(displayId);
-            if (it == g_sidecarModels.end() || it->second.empty()) return false;
+            if (!LoadSidecarModels())
+            {
+                RememberPendingDb2Slot(cmo, a.modelSlot, displayId);
+                return false;
+            }
+            auto it = g_itemDisplayIndex->models.find(displayId);
+            if (it == g_itemDisplayIndex->models.end() || it->second.empty()) return false;
 
             bool added = false;
             uint32_t sidecarIndex = 0;
@@ -2138,6 +1852,8 @@ namespace wxl::scripts::equipextension
 
         void* cmo = a.charModelObj;
 
+        ForgetPendingDb2Slot(cmo, modelSlot);
+
         DetachSlotEntries(cmo, modelSlot);
 
         void* subObj = GuardedReadPtr(reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoSceneNode);
@@ -2147,6 +1863,26 @@ namespace wxl::scripts::equipextension
     void EquipExtension::OnM2PerFrameUpdate(const ev::M2PerFrameUpdateArgs& a)
     {
         void* renderCtx = a.renderCtx;
+
+        // Login and ModelFrame construction usually happen before the large DB2/SKIN index finishes.
+        // Re-run those exact slot rebuilds once the immutable snapshot is published; otherwise an early
+        // DBC fallback can remain stuck in CharacterModelFrame until the player manually re-equips it.
+        LoadSidecarModels();
+        if (!g_pendingDb2Slots.empty() && g_itemDisplayIndex &&
+            g_itemDisplayIndex != g_refreshedItemDisplayIndex)
+        {
+            g_refreshedItemDisplayIndex = g_itemDisplayIndex;
+            const std::vector<PendingDb2Slot> pending = g_pendingDb2Slots;
+            for (const PendingDb2Slot& slot : pending)
+            {
+                if (!slot.cmo || slot.modelSlot >= 11 || !slot.displayId) continue;
+                if (!GuardedReadPtr(reinterpret_cast<uint8_t*>(slot.cmo) + m2::kOffCmoSceneNode)) continue;
+                uint32_t displayId = slot.displayId;
+                OnItemSlotChange({slot.cmo, slot.modelSlot, &displayId});
+            }
+            g_modelFrameRefreshPending = true;
+        }
+
         if (g_attached.empty()) return;
 
         // Purge dead CMOs: cmo->sceneNode is zeroed when WoW frees the character model object.
@@ -2182,6 +1918,27 @@ namespace wxl::scripts::equipextension
                 if (!e.renderCtx) { hasPending = true; break; }
             if (hasPending) { RebuildAllModels(cmo); return; }
 
+            // CharacterModelFrame is a native clone of this tree. A clone made during an earlier DB2
+            // phase cannot gain collection children that did not exist yet. Wait until every rebuilt
+            // child on the live character has a render context, then reclone on the next UI update.
+            if (g_modelFrameRefreshPending)
+            {
+                g_modelFrameRefreshPending = false;
+                wxl::runtime::lua::ExecuteCurrent("retail-db2-model-frame-refresh", R"lua(
+if CharacterModelFrame and CharacterModelFrame.IsShown and CharacterModelFrame:IsShown() then
+    if not WXL_RetailModelFrameRefresh then
+        WXL_RetailModelFrameRefresh = CreateFrame("Frame")
+    end
+    WXL_RetailModelFrameRefresh:SetScript("OnUpdate", function(self)
+        self:SetScript("OnUpdate", nil)
+        if CharacterModelFrame and CharacterModelFrame:IsShown() then
+            CharacterModelFrame:SetUnit("player")
+        end
+    end)
+end
+)lua");
+            }
+
             // charBuf: character bone palette. Valid when the character model is rendering.
             auto* charBuf = reinterpret_cast<uint8_t*>(
                 GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstBonePalette));
@@ -2189,6 +1946,8 @@ namespace wxl::scripts::equipextension
             {
                 for (auto& entry : entries)
                 {
+                    // A collection model may legitimately use every skin section (no geoset filter).
+                    // It still owns a retail skeleton and must be driven from the character palette.
                     if (!IsCollectionEntry(entry)) continue;
                     if (!entry.renderCtx || entry.boneRemap.count == 0) continue;
                     auto* collBuf = reinterpret_cast<uint8_t*>(
@@ -2207,8 +1966,9 @@ namespace wxl::scripts::equipextension
                     const BoneRemap& remap = entry.boneRemap;
                     const uint32_t collBoneCount = RenderCtxBoneCountGuarded(entry.renderCtx);
                     const uint32_t charBoneCount = RenderCtxBoneCountGuarded(renderCtx);
-                    if (!CopyRemappedBonesGuarded(collBuf, collBoneCount, charBuf, charBoneCount,
-                                                  remap, entry.renderCtx, renderCtx))
+                    if (!CopyRemappedBonesGuarded(collBuf, collBoneCount,
+                                                  charBuf, charBoneCount, remap,
+                                                  entry.renderCtx, renderCtx))
                     {
                         EquipLog("  CharSweep(bone): guarded copy failed rctx=0x%p count=%u",
                                  entry.renderCtx, (uint32_t)remap.count);
@@ -2341,6 +2101,9 @@ namespace wxl::scripts::equipextension
                         }
                     }
 
+                    // The async model or character skeleton is not ready yet. Leave this context
+                    // attached and retry on a later frame instead of treating a missing remap as
+                    // an identity failure and forcing a rebuild loop.
                     if (remap.count == 0)
                     {
                         entry.perFrameLogged = true;
@@ -2377,8 +2140,9 @@ namespace wxl::scripts::equipextension
                     {
                         const uint32_t collBoneCount = RenderCtxBoneCountGuarded(renderCtx);
                         const uint32_t charBoneCount = RenderCtxBoneCountGuarded(charCtx);
-                        if (!CopyRemappedBonesGuarded(collBuf, collBoneCount, charBuf, charBoneCount,
-                                                      remap, renderCtx, charCtx))
+                        if (!CopyRemappedBonesGuarded(collBuf, collBoneCount,
+                                                      charBuf, charBoneCount, remap,
+                                                      renderCtx, charCtx))
                         {
                             EquipLog("  PerFrame(copy): guarded copy failed rctx=0x%p count=%u",
                                      renderCtx, (uint32_t)remap.count);
@@ -2470,8 +2234,9 @@ namespace wxl::scripts::equipextension
                         {
                             const uint32_t collBoneCount = RenderCtxBoneCountGuarded(entry.renderCtx);
                             const uint32_t charBoneCount = RenderCtxBoneCountGuarded(charCtx);
-                            if (!CopyRemappedBonesGuarded(collBuf, collBoneCount, charBuf, charBoneCount,
-                                                          remap, entry.renderCtx, charCtx))
+                            if (!CopyRemappedBonesGuarded(collBuf, collBoneCount,
+                                                          charBuf, charBoneCount, remap,
+                                                          entry.renderCtx, charCtx))
                             {
                                 EquipLog("  OnM2SkinFinalize(copy): guarded copy failed rctx=0x%p count=%u",
                                          entry.renderCtx, (uint32_t)remap.count);
@@ -2562,39 +2327,59 @@ namespace wxl::scripts::equipextension
     }
 
     // ─── OnBuildBonePalette ───────────────────────────────────────────────────────
-    // Re-apply the character remap after the engine's native palette build. ModelFrame clones do not fire
-    // equip-slot events, but preserve the shared collection/character model pair, so handle those too.
+    // Fires POST-engine on every kBuildBonePalette call (one per M2 instance per frame).
+    // The engine drives collection models with their retail skeleton, so its native pass can
+    // overwrite the character-bone remap just before GPU upload. CharacterModelFrame also clones
+    // the entire M2 tree without firing equip-slot events. Handle exact tracked instances by
+    // pointer and those clones by their preserved shared-model pair, then re-apply the remap here.
     void EquipExtension::OnBuildBonePalette(const ev::BuildBonePaletteArgs& a)
     {
         if (g_attached.empty() || !a.renderCtx) return;
         void* renderCtx = a.renderCtx;
-        void* childModel = GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstModel);
+        void* childModel = GuardedReadPtr(
+            reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstModel);
         AttachEntry* cloneCandidate = nullptr;
         void* clonePoseSource = nullptr;
 
+        // Handle exact tracked instances immediately while remembering at most one validated
+        // ModelFrame clone candidate. This keeps the hot callback to one g_attached traversal.
         for (auto& [cmo, entries] : g_attached)
         {
-            void* charRctx = GuardedReadPtr(reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoSceneNode);
+            void* charRctx = GuardedReadPtr(
+                reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoSceneNode);
+
             for (auto& entry : entries)
             {
                 if (!IsCollectionEntry(entry)) continue;
+
                 if (entry.renderCtx != renderCtx)
                 {
-                    if (!cloneCandidate && childModel && BoneRemapHasMatch(entry.boneRemap) &&
-                        entry.boneRemap.collectionModel == childModel)
+                    if (!cloneCandidate && childModel &&
+                        BoneRemapHasMatch(entry.boneRemap) &&
+                        entry.boneRemap.collectionModel == childModel &&
+                        entry.boneRemap.characterModel)
                     {
-                        void* source = FindAncestorWithModelGuarded(renderCtx, entry.boneRemap.characterModel);
-                        if (source) { cloneCandidate = &entry; clonePoseSource = source; }
+                        void* candidateSource = FindAncestorWithModelGuarded(
+                            renderCtx, entry.boneRemap.characterModel);
+                        if (candidateSource)
+                        {
+                            cloneCandidate = &entry;
+                            clonePoseSource = candidateSource;
+                        }
                     }
                     continue;
                 }
 
-                void* poseSource = FindAncestorWithModelGuarded(renderCtx, entry.boneRemap.characterModel);
+                // The native parent is authoritative after attachment. Resolve by model identity
+                // so a mounted character is selected instead of an outer vehicle/root instance.
+                void* poseSource = FindAncestorWithModelGuarded(
+                    renderCtx, entry.boneRemap.characterModel);
                 if (!poseSource) poseSource = NativeParentGuarded(renderCtx);
                 if (!poseSource) poseSource = charRctx;
                 if (!poseSource || poseSource == renderCtx) return;
 
-                if (!BoneRemapMatchesContextsGuarded(entry.boneRemap, renderCtx, poseSource))
+                if (!BoneRemapMatchesContextsGuarded(
+                        entry.boneRemap, renderCtx, poseSource))
                 {
                     BoneRemap rebuilt = BuildBoneRemapGuarded(renderCtx, poseSource);
                     if (!BoneRemapHasMatch(rebuilt)) return;
@@ -2605,27 +2390,59 @@ namespace wxl::scripts::equipextension
                 const BoneRemap& remap = entry.boneRemap;
                 auto* charBuf = reinterpret_cast<uint8_t*>(GuardedReadPtr(
                     reinterpret_cast<uint8_t*>(poseSource) + m2::kOffInstBonePalette));
-                auto* collBuf = reinterpret_cast<uint8_t*>(GuardedReadPtr(
-                    reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstBonePalette));
+                auto* collBuf = reinterpret_cast<uint8_t*>(
+                    GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstBonePalette));
                 if (!charBuf || !collBuf) return;
-                if (!CopyRemappedBonesGuarded(collBuf, RenderCtxBoneCountGuarded(renderCtx),
-                                              charBuf, RenderCtxBoneCountGuarded(poseSource),
-                                              remap, renderCtx, poseSource))
+
+                if (!entry.bbpLogDone)
                 {
-                    const bool stale = GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) +
-                                                      m2::kOffInstModel) != remap.collectionModel;
+                    uint32_t initF = GuardedReadU32(
+                        reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstInitFlags);
+                    uint32_t xff = 0;
+                    for (uint32_t bi = 0; bi < remap.count; ++bi)
+                        if (remap.collToChar[bi] == 0xFF) ++xff;
+                    EquipLog("  OnBBP[first] collRctx=0x%p cmoParent=0x%p nativeSource=0x%p"
+                             " initF=0x%X count=%u xff=%u"
+                             " map0-7=[%u %u %u %u %u %u %u %u]",
+                             renderCtx, charRctx, poseSource,
+                             initF, (uint32_t)remap.count, xff,
+                             remap.count>0 ? (uint32_t)remap.collToChar[0] : 255u,
+                             remap.count>1 ? (uint32_t)remap.collToChar[1] : 255u,
+                             remap.count>2 ? (uint32_t)remap.collToChar[2] : 255u,
+                             remap.count>3 ? (uint32_t)remap.collToChar[3] : 255u,
+                             remap.count>4 ? (uint32_t)remap.collToChar[4] : 255u,
+                             remap.count>5 ? (uint32_t)remap.collToChar[5] : 255u,
+                             remap.count>6 ? (uint32_t)remap.collToChar[6] : 255u,
+                             remap.count>7 ? (uint32_t)remap.collToChar[7] : 255u);
+                    entry.bbpLogDone = true;
+                }
+
+                const uint32_t collBoneCount = RenderCtxBoneCountGuarded(renderCtx);
+                const uint32_t charBoneCount = RenderCtxBoneCountGuarded(poseSource);
+                if (!CopyRemappedBonesGuarded(collBuf, collBoneCount,
+                                              charBuf, charBoneCount, remap,
+                                              renderCtx, poseSource))
+                {
+                    EquipLog("  OnBBP(copy): guarded copy failed rctx=0x%p count=%u",
+                             renderCtx, (uint32_t)remap.count);
+                    const bool staleDestination =
+                        GuardedReadPtr(reinterpret_cast<uint8_t*>(renderCtx) +
+                                       m2::kOffInstModel) != remap.collectionModel;
                     for (auto& sibling : entries)
                     {
                         if (sibling.renderCtx != renderCtx) continue;
                         sibling.boneRemap = {};
-                        if (stale) sibling.renderCtx = nullptr;
+                        if (staleDestination) sibling.renderCtx = nullptr;
                     }
                 }
-                entry.bbpLogDone = true;
-                return;
+                return; // renderCtx is unique per (keyBuf,attachId,texBuf) group; one copy suffices
             }
         }
 
+        // CharacterModelFrame/PlayerModel duplicates the complete character M2 tree. Those clone
+        // children never pass through CharModelSlotDispatch and therefore have new renderCtx
+        // pointers absent from g_attached. DuplicateModel does preserve both shared model pointers,
+        // so the (collection model, character ancestor model) pair safely identifies the clone.
         if (!cloneCandidate || !clonePoseSource) return;
         const BoneRemap& remap = cloneCandidate->boneRemap;
         auto* charBuf = reinterpret_cast<uint8_t*>(GuardedReadPtr(
@@ -2633,16 +2450,31 @@ namespace wxl::scripts::equipextension
         auto* collBuf = reinterpret_cast<uint8_t*>(GuardedReadPtr(
             reinterpret_cast<uint8_t*>(renderCtx) + m2::kOffInstBonePalette));
         if (!charBuf || !collBuf) return;
-        if (CopyRemappedBonesGuarded(collBuf, RenderCtxBoneCountGuarded(renderCtx),
-                                    charBuf, RenderCtxBoneCountGuarded(clonePoseSource),
-                                    remap, renderCtx, clonePoseSource))
+
+        const uint32_t collBoneCount = RenderCtxBoneCountGuarded(renderCtx);
+        const uint32_t charBoneCount = RenderCtxBoneCountGuarded(clonePoseSource);
+        if (!CopyRemappedBonesGuarded(collBuf, collBoneCount,
+                                      charBuf, charBoneCount, remap,
+                                      renderCtx, clonePoseSource))
+            return;
+
+        if (!cloneCandidate->cloneBbpLogDone)
+        {
+            EquipLog("  OnBBP[clone] collRctx=0x%p source=0x%p collModel=0x%p"
+                     " charModel=0x%p count=%u",
+                     renderCtx, clonePoseSource, remap.collectionModel,
+                     remap.characterModel, (uint32_t)remap.count);
             cloneCandidate->cloneBbpLogDone = true;
+        }
     }
 
     // ─── Constructor ──────────────────────────────────────────────────────────────
 
     EquipExtension::EquipExtension()
     {
+        // Recovery/isolation switch for collection attachment and bone-palette handling. The
+        // core hooks remain installed, but no equip-extension callbacks are subscribed when the
+        // flag is present, allowing a character wearing problematic retail gear to enter safely.
         if (GetFileAttributesA("WarcraftXL_equip-extension.disable") != INVALID_FILE_ATTRIBUTES)
         {
             WLOG_WARN("equip-extension: disabled by client flag");
