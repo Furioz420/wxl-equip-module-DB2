@@ -25,7 +25,7 @@
 #include "offsets/game/DB2.hpp"
 #include "offsets/game/M2.hpp"
 #include "runtime/LuaBindings.hpp"
-#include "runtime/db2/ItemDisplayIndex.hpp"
+#include "wxl-host-extension/shared/db2/ItemDisplayIndex.hpp"
 
 #include <windows.h>
 
@@ -93,7 +93,6 @@ namespace wxl::scripts::equipextension
     static std::unordered_map<void*, std::vector<AttachEntry>> g_attached;
 
     static std::shared_ptr<const itemdisplay::Index> g_itemDisplayIndex;
-    static std::shared_ptr<const itemdisplay::Index> g_refreshedItemDisplayIndex;
     static bool g_modelFrameRefreshPending = false;
     static bool g_itemDisplayIndexWaitLogged = false;
     struct PendingDb2Slot
@@ -101,6 +100,7 @@ namespace wxl::scripts::equipextension
         void* cmo = nullptr;
         uint32_t modelSlot = static_cast<uint32_t>(-1);
         uint32_t displayId = 0;
+        std::shared_ptr<const itemdisplay::Index> appliedIndex;
     };
     static std::vector<PendingDb2Slot> g_pendingDb2Slots;
 
@@ -121,10 +121,22 @@ namespace wxl::scripts::equipextension
         for (PendingDb2Slot& pending : g_pendingDb2Slots)
         {
             if (pending.cmo != cmo || pending.modelSlot != modelSlot) continue;
+            if (pending.displayId != displayId)
+                pending.appliedIndex.reset();
             pending.displayId = displayId;
             return;
         }
-        g_pendingDb2Slots.push_back({cmo, modelSlot, displayId});
+        g_pendingDb2Slots.push_back({cmo, modelSlot, displayId, {}});
+    }
+
+    static void MarkPendingDb2SlotApplied(void* cmo, uint32_t modelSlot)
+    {
+        for (PendingDb2Slot& pending : g_pendingDb2Slots)
+        {
+            if (pending.cmo != cmo || pending.modelSlot != modelSlot) continue;
+            pending.appliedIndex = g_itemDisplayIndex;
+            return;
+        }
     }
 
     // Set to the cmo being processed in RebuildAllModels Phase1. OnM2SkinFinalize uses
@@ -823,6 +835,23 @@ namespace wxl::scripts::equipextension
         return e.geoFilter.count > 0 || IsCollectionObjectPath(e.keyBuf);
     }
 
+    static bool IsRootSkinnedEntry(const AttachEntry& e) noexcept
+    {
+        // Retail ModelType=1 cape M2s are full character-space skinned models. The DB2
+        // builder marks them with the synthetic root attachment even though their path is
+        // under ObjectComponents\Cape rather than ObjectComponents\Collections.
+        return e.attachId == kCollectionAttach &&
+               (IsCollectionEntry(e) || e.equipSlot == 10);
+    }
+
+    static bool NeedsManualBoneRemap(const AttachEntry& e) noexcept
+    {
+        // Full-body collection overlays are attached to the character root and need their
+        // palette driven from the character skeleton. Dedicated helm/shoulder/belt models use
+        // native attachment points and must retain their own accessory-bone animation chains.
+        return IsRootSkinnedEntry(e);
+    }
+
     static bool ShouldDetachDefaultAttachPoints(const AttachEntry& e) noexcept
     {
         if (e.equipSlot >= 11) return false;
@@ -1039,9 +1068,11 @@ namespace wxl::scripts::equipextension
                                   StartsWithCI(m.texture, "__hide__") ||
                                   StartsWithCI(m.texture, "hide");
             const bool slotTargetMode = ContainsCI(m.targetMode, "SlotGeosets");
+            const bool skinMapTargetMode = ContainsCI(m.targetMode, "SkinMapOnly");
             const bool hasTargets =
                 m.targetBatchIndexes[0] || m.targetSkinSectionIds[0] ||
-                (slotTargetMode && (m.batchIndexes[0] || m.skinSectionIds[0]));
+                ((slotTargetMode || skinMapTargetMode) &&
+                 (m.batchIndexes[0] || m.skinSectionIds[0]));
             if (!hasTargets && !edgeFadeHide) continue;
             if (!isCollection && !hideMode && m.layer == 0 && m.textureType == 2) continue;
             return true;
@@ -1083,8 +1114,9 @@ namespace wxl::scripts::equipextension
             if (!isCollection && !hideMode && m.layer == 0 && m.textureType == 2) continue;
 
             const bool slotTargetMode = ContainsCI(m.targetMode, "SlotGeosets");
+            const bool skinMapTargetMode = ContainsCI(m.targetMode, "SkinMapOnly");
             const bool collectionSkinMapTargets =
-                isCollection && m.batchIndexes[0] && !edgeFadeHide;
+                (isCollection || skinMapTargetMode) && m.batchIndexes[0] && !edgeFadeHide;
             const char* targetBatches = collectionSkinMapTargets
                 ? m.batchIndexes
                 : FirstNonEmpty(m.targetBatchIndexes, slotTargetMode ? m.batchIndexes : "");
@@ -1402,6 +1434,7 @@ namespace wxl::scripts::equipextension
 
             void* rctx = e.renderCtx;
             bool isCollection = IsCollectionEntry(e);
+            const bool forceRootAttach = IsRootSkinnedEntry(e);
 
             if (e.texBuf[0])
             {
@@ -1430,12 +1463,14 @@ namespace wxl::scripts::equipextension
             uint32_t subInitFlags = GuardedReadU32(reinterpret_cast<uint8_t*>(subObj) + m2::kOffInstInitFlags);
             EquipLog("  Phase3[%zu] attach=%u rctx=0x%p subObj_initFlags=0x%X isCollection=%d",
                      i, e.attachId, rctx, subInitFlags, (int)isCollection);
-            gm2::AttachToScene(rctx, subObj, e.attachId, isCollection);
+            gm2::AttachToScene(rctx, subObj, e.attachId, forceRootAttach);
 
             // The known CMO scene node is the character pose source here. Record the native link
             // as a diagnostic; it should be identical immediately after AttachToParent.
             void* nativeParent = NativeParentGuarded(rctx);
-            BoneRemap remap = BuildBoneRemapGuarded(rctx, subObj);
+            BoneRemap remap = {};
+            if (NeedsManualBoneRemap(e))
+                remap = BuildBoneRemapGuarded(rctx, subObj);
             EquipLog("  Phase3[%zu] boneRemap.count=%u requestedParent=0x%p nativeParent=0x%p",
                      i, (uint32_t)remap.count, subObj, nativeParent);
 
@@ -1842,6 +1877,7 @@ namespace wxl::scripts::equipextension
 
         EquipLog("  calling RebuildAllModels");
         RebuildAllModels(cmo);
+        MarkPendingDb2SlotApplied(cmo, a.modelSlot);
     }
 
     void EquipExtension::OnItemSlotClear(const ev::ItemSlotClearArgs& a)
@@ -1864,23 +1900,29 @@ namespace wxl::scripts::equipextension
     {
         void* renderCtx = a.renderCtx;
 
-        // Login and ModelFrame construction usually happen before the large DB2/SKIN index finishes.
-        // Re-run those exact slot rebuilds once the immutable snapshot is published; otherwise an early
-        // DBC fallback can remain stuck in CharacterModelFrame until the player manually re-equips it.
+        // Login and ModelFrame construction can dispatch slots before their CMO owns a scene node.
+        // Track publication per slot/CMO rather than globally: a Glue/ModelFrame CMO may consume the
+        // current snapshot before the later in-world CMO even exists. Replaying only when this CMO's
+        // own render context is ticking also avoids scanning/rebuilding every pending character for
+        // every recursively updated child M2.
         LoadSidecarModels();
-        if (!g_pendingDb2Slots.empty() && g_itemDisplayIndex &&
-            g_itemDisplayIndex != g_refreshedItemDisplayIndex)
+        if (!g_pendingDb2Slots.empty() && g_itemDisplayIndex)
         {
-            g_refreshedItemDisplayIndex = g_itemDisplayIndex;
             const std::vector<PendingDb2Slot> pending = g_pendingDb2Slots;
+            bool refreshed = false;
             for (const PendingDb2Slot& slot : pending)
             {
                 if (!slot.cmo || slot.modelSlot >= 11 || !slot.displayId) continue;
-                if (!GuardedReadPtr(reinterpret_cast<uint8_t*>(slot.cmo) + m2::kOffCmoSceneNode)) continue;
+                if (slot.appliedIndex == g_itemDisplayIndex) continue;
+                void* sceneNode =
+                    GuardedReadPtr(reinterpret_cast<uint8_t*>(slot.cmo) + m2::kOffCmoSceneNode);
+                if (!sceneNode || sceneNode != renderCtx) continue;
                 uint32_t displayId = slot.displayId;
                 OnItemSlotChange({slot.cmo, slot.modelSlot, &displayId});
+                refreshed = true;
             }
-            g_modelFrameRefreshPending = true;
+            if (refreshed)
+                g_modelFrameRefreshPending = true;
         }
 
         if (g_attached.empty()) return;
@@ -1948,7 +1990,7 @@ end
                 {
                     // A collection model may legitimately use every skin section (no geoset filter).
                     // It still owns a retail skeleton and must be driven from the character palette.
-                    if (!IsCollectionEntry(entry)) continue;
+                    if (!NeedsManualBoneRemap(entry)) continue;
                     if (!entry.renderCtx || entry.boneRemap.count == 0) continue;
                     auto* collBuf = reinterpret_cast<uint8_t*>(
                         GuardedReadPtr(reinterpret_cast<uint8_t*>(entry.renderCtx) + m2::kOffInstBonePalette));
@@ -2025,7 +2067,8 @@ end
                                     // Keep the texture handle alive for the attached render context.
                                 }
                             }
-                            gm2::AttachToScene(rctx, entry.subObj, entry.attachId, IsCollectionEntry(entry));
+                            gm2::AttachToScene(rctx, entry.subObj, entry.attachId,
+                                              IsRootSkinnedEntry(entry));
                             for (auto& e2 : entries)
                                 if (e2.renderCtx == renderCtx) e2.renderCtx = rctx;
                             gm2::ReleaseRenderCtx(rctx);
@@ -2047,7 +2090,7 @@ end
                 // Bone matrix copy via 3-pass remap table.
                 // charCtx is the character's render_ctx (= cmo->sceneNode = the outer frame call).
                 // The collection M2's bone buffer is overwritten with corresponding char matrices.
-                if (!IsCollectionEntry(entry)) return;
+                if (!NeedsManualBoneRemap(entry)) return;
                 void* charCtx = GuardedReadPtr(reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoSceneNode);
                 if (charCtx && charCtx != renderCtx)
                 {
@@ -2208,7 +2251,7 @@ end
                 // collection model is parsed. PerFrame retries if collBuf is still null here.
                 void* charCtx = GuardedReadPtr(
                     reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoSceneNode);
-                if (charCtx && charCtx != entry.renderCtx)
+                if (NeedsManualBoneRemap(entry) && charCtx && charCtx != entry.renderCtx)
                 {
                     if (entry.boneRemap.count == 0)
                     {
@@ -2350,7 +2393,7 @@ end
 
             for (auto& entry : entries)
             {
-                if (!IsCollectionEntry(entry)) continue;
+                if (!NeedsManualBoneRemap(entry)) continue;
 
                 if (entry.renderCtx != renderCtx)
                 {
