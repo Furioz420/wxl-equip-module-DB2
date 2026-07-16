@@ -435,9 +435,25 @@ namespace wxl::scripts::equipextension
             return true;
         }
 
+        static uint32_t TextureFlags(const std::vector<uint8_t>& modelBytes,
+                                     uint32_t textureIndex) noexcept
+        {
+            namespace fmt = wxl::structure::m2;
+            if (modelBytes.size() < sizeof(fmt::M2Header)) return 0;
+            if (ReadU32(modelBytes, 0x00) != fmt::kMagicMD20) return 0;
+
+            const uint32_t texCount = ReadU32(modelBytes, 0x50);
+            const uint32_t texOfs = ReadU32(modelBytes, 0x54);
+            constexpr uint32_t kTexStride = sizeof(fmt::M2Texture);
+            if (textureIndex >= texCount || texOfs > modelBytes.size()) return 0;
+            if (texCount > (modelBytes.size() - texOfs) / kTexStride) return 0;
+            return ReadU32(modelBytes, texOfs + textureIndex * kTexStride + 0x04);
+        }
+
         static uint32_t AppendHardcodedTexture(std::vector<uint8_t>& modelBytes,
                                                const char* path,
-                                               size_t pathLen) noexcept
+                                               size_t pathLen,
+                                               uint32_t flags) noexcept
         {
             namespace fmt = wxl::structure::m2;
             if (!path || pathLen == 0 || modelBytes.size() < sizeof(fmt::M2Header)) return 0xffffffffu;
@@ -463,7 +479,10 @@ namespace wxl::scripts::equipextension
             const size_t rec = modelBytes.size();
             modelBytes.resize(modelBytes.size() + kTexStride);
             WriteU32(modelBytes, rec + 0x00, fmt::kTexTypeHardcoded);
-            WriteU32(modelBytes, rec + 0x04, 0);
+            // Preserve the replaced slot's wrap/clamp state. Animated UV overlays commonly
+            // require both wrap bits; clearing them makes the texture clamp for most of its
+            // scroll and visibly snap when the global sequence loops.
+            WriteU32(modelBytes, rec + 0x04, flags);
             WriteU32(modelBytes, rec + 0x08, static_cast<uint32_t>(pathLen + 1));
             WriteU32(modelBytes, rec + 0x0C, pathOfs);
 
@@ -592,7 +611,29 @@ namespace wxl::scripts::equipextension
             {
                 if (!hasTexturePatches) break;
                 if (patches[pi].hide) continue;
-                const uint32_t newTexIndex = AppendHardcodedTexture(modelBytes, patches[pi].path, patches[pi].pathLen);
+
+                uint32_t replacementFlags = 0;
+                bool hasTarget = false;
+                for (uint32_t bi = 0; bi < batchCount; ++bi)
+                {
+                    const size_t b = batchOfs + static_cast<size_t>(bi) * kBatchStride;
+                    if (bi < hiddenBatches.size() && hiddenBatches[bi]) continue;
+                    if (!BatchMatchesPatch(patches[pi], skinBytes, bi, b, submeshCount, submeshOfs))
+                        continue;
+
+                    const uint16_t textureCount = ReadU16(skinBytes, b + 0x0E);
+                    const uint16_t comboIndex = ReadU16(skinBytes, b + 0x10);
+                    if (textureCount == 0 || patches[pi].layer >= textureCount) continue;
+                    if (static_cast<uint32_t>(comboIndex) + textureCount > combos.size()) continue;
+                    replacementFlags =
+                        TextureFlags(modelBytes, combos[comboIndex + patches[pi].layer]);
+                    hasTarget = true;
+                    break;
+                }
+                if (!hasTarget) continue;
+
+                const uint32_t newTexIndex = AppendHardcodedTexture(
+                    modelBytes, patches[pi].path, patches[pi].pathLen, replacementFlags);
                 if (newTexIndex == 0xffffffffu) continue;
                 ++appendedTextures;
 
