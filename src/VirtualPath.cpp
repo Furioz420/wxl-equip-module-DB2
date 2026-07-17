@@ -650,10 +650,22 @@ namespace wxl::scripts::equipextension
                     if (static_cast<uint32_t>(comboIndex) + textureCount > combos.size()) continue;
                     if (combos.size() + textureCount > 0xffffu) continue;
 
+                    const uint16_t donorTextureIndex =
+                        combos[comboIndex + patches[pi].layer];
                     const uint16_t newComboIndex = static_cast<uint16_t>(combos.size());
                     for (uint32_t ti = 0; ti < textureCount; ++ti)
-                        combos.push_back(combos[comboIndex + ti]);
-                    combos[newComboIndex + patches[pi].layer] = static_cast<uint16_t>(newTexIndex);
+                    {
+                        const uint16_t sourceTextureIndex = combos[comboIndex + ti];
+                        // A material resource can be sampled more than once by the same batch. Retail
+                        // animated layers commonly use T1_T1 (for example shader 0x4011), so both combo
+                        // entries refer to the one type-3 texture resource. Patching only the ordinal
+                        // layer turns that into base+effect and incorrectly modulates the effect through
+                        // the character's base skin. Replace every sample of the selected resource while
+                        // leaving other texture records (including the separate solid-base batches) alone.
+                        combos.push_back(sourceTextureIndex == donorTextureIndex
+                                             ? static_cast<uint16_t>(newTexIndex)
+                                             : sourceTextureIndex);
+                    }
                     WriteLeU16(skinBytes, b + 0x10, newComboIndex);
                     ++patchedBatches;
                 }
