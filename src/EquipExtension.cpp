@@ -25,7 +25,11 @@
 #include "offsets/game/DB2.hpp"
 #include "offsets/game/M2.hpp"
 #include "runtime/LuaBindings.hpp"
+#if __has_include("wxl-host-extension/shared/db2/ItemDisplayIndex.hpp")
 #include "wxl-host-extension/shared/db2/ItemDisplayIndex.hpp"
+#else
+#include "runtime/db2/ItemDisplayIndex.hpp"
+#endif
 
 #include <windows.h>
 
