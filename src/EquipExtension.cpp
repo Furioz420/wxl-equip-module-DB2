@@ -24,7 +24,6 @@
 #include "offsets/engine/Io.hpp"
 #include "offsets/game/DB2.hpp"
 #include "offsets/game/M2.hpp"
-#include "runtime/LuaBindings.hpp"
 #if __has_include("wxl-host-extension/shared/db2/ItemDisplayIndex.hpp")
 #include "wxl-host-extension/shared/db2/ItemDisplayIndex.hpp"
 #else
@@ -97,7 +96,6 @@ namespace wxl::scripts::equipextension
     static std::unordered_map<void*, std::vector<AttachEntry>> g_attached;
 
     static std::shared_ptr<const itemdisplay::Index> g_itemDisplayIndex;
-    static bool g_modelFrameRefreshPending = false;
     static bool g_itemDisplayIndexWaitLogged = false;
     struct PendingDb2Slot
     {
@@ -138,6 +136,17 @@ namespace wxl::scripts::equipextension
         for (PendingDb2Slot& pending : g_pendingDb2Slots)
         {
             if (pending.cmo != cmo || pending.modelSlot != modelSlot) continue;
+            // A model snapshot can be ready before its on-demand material/SKIN rows are.  Do
+            // not consume that interim snapshot: an unpatched virtual cape can otherwise stay
+            // attached until the player manually changes the slot.  The material service
+            // publishes the resolved marker and its rows in the same immutable snapshot.
+            if (!g_itemDisplayIndex ||
+                !g_itemDisplayIndex->resolvedMaterialDisplays.contains(pending.displayId))
+            {
+                pending.appliedIndex.reset();
+                return;
+            }
+
             pending.appliedIndex = g_itemDisplayIndex;
             return;
         }
@@ -848,6 +857,242 @@ namespace wxl::scripts::equipextension
                (IsCollectionEntry(e) || e.equipSlot == 10);
     }
 
+#if 0
+    // Rejected CharacterModelFrame experiment, retained only as reverse-engineering reference.
+    // This must not be enabled globally: CCharacterComponent::RemoveVisuals is also used by
+    // Glue character selection, where replaying these children creates duplicates and stale
+    // pre-material cape clones. A future implementation must be scoped to the actual frame.
+    static bool ModelFrameHasTrackedClone(void* cloneRoot,
+                                          void* sourceChild,
+                                          uint32_t attachId) noexcept
+    {
+        if (!cloneRoot || !sourceChild) return false;
+
+        void* seen[256] = {};
+        void* child = GuardedReadPtr(
+            reinterpret_cast<uint8_t*>(cloneRoot) + kOffInstChildHead);
+        for (uint32_t count = 0; child && count < 256; ++count)
+        {
+            for (uint32_t i = 0; i < count; ++i)
+                if (seen[i] == child) return false;
+            seen[count] = child;
+
+            if (GuardedReadPtr(reinterpret_cast<uint8_t*>(child) +
+                               kOffInstDuplicateSource) == sourceChild &&
+                GuardedReadU32(reinterpret_cast<uint8_t*>(child) + kOffInstAttachId) == attachId)
+                return true;
+
+            void* next = GuardedReadPtr(
+                reinterpret_cast<uint8_t*>(child) + kOffInstSiblingNext);
+            if (next == child) return false;
+            child = next;
+        }
+        return false;
+    }
+
+    static bool SourceHasDirectTrackedChild(void* sourceRoot,
+                                            void* wantedChild,
+                                            uint32_t attachId) noexcept
+    {
+        if (!sourceRoot || !wantedChild) return false;
+
+        void* seen[256] = {};
+        void* child = GuardedReadPtr(
+            reinterpret_cast<uint8_t*>(sourceRoot) + kOffInstChildHead);
+        for (uint32_t count = 0; child && count < 256; ++count)
+        {
+            for (uint32_t i = 0; i < count; ++i)
+                if (seen[i] == child) return false;
+            seen[count] = child;
+
+            if (child == wantedChild &&
+                GuardedReadPtr(reinterpret_cast<uint8_t*>(child) +
+                               m2::kOffInstParent) == sourceRoot &&
+                GuardedReadU32(reinterpret_cast<uint8_t*>(child) +
+                               kOffInstAttachId) == attachId)
+                return true;
+
+            void* next = GuardedReadPtr(
+                reinterpret_cast<uint8_t*>(child) + kOffInstSiblingNext);
+            if (next == child) return false;
+            child = next;
+        }
+        return false;
+    }
+
+    static void* DuplicateModelGuarded(void* scene, void* sourceChild) noexcept
+    {
+        if (!scene || !sourceChild) return nullptr;
+        void* clone = nullptr;
+        __try
+        {
+            clone = Native<DuplicateModelFn>(kDuplicateModel)(
+                scene, sourceChild, 0);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return clone;
+    }
+
+    static bool AttachModelFrameCloneGuarded(void* cloneChild,
+                                             void* cloneRoot,
+                                             uint32_t attachId,
+                                             bool forceAttach) noexcept
+    {
+        if (!cloneChild || !cloneRoot) return false;
+        bool attached = false;
+        __try
+        {
+            gm2::AttachToScene(cloneChild, cloneRoot, attachId, forceAttach);
+            attached = true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        // DuplicateModel returns a local reference. AttachToScene retains its own reference when
+        // successful; release ours in both cases so a rejected attachment cannot leak.
+        __try { gm2::ReleaseRenderCtx(cloneChild); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return attached;
+    }
+
+    struct ModelFrameReplayEntry
+    {
+        void* sourceChild;
+        uint32_t attachId;
+        bool forceAttach;
+    };
+
+    static void ReplayTrackedModelFrameChildren(void* cloneRoot) noexcept
+    {
+        if (!cloneRoot || g_attached.empty()) return;
+
+        // DuplicateModel records the exact source instance at +0x30. Match that identity against
+        // the source stamped into each tracked entry. Do not require the owning CMO's current
+        // scene-node pointer to still match: a CMO can replace +0x38 while the duplicated source
+        // tree and its tracked children remain valid long enough for this callback.
+        void* sourceRoot = GuardedReadPtr(
+            reinterpret_cast<uint8_t*>(cloneRoot) + kOffInstDuplicateSource);
+        void* scene = GuardedReadPtr(
+            reinterpret_cast<uint8_t*>(cloneRoot) + kOffInstScene);
+        if (!sourceRoot || !scene) return;
+
+        // Native DuplicateModel/AttachToScene calls can synchronously enter other WXL callbacks.
+        // Validate and copy a bounded POD plan first so no unordered_map iterator or AttachEntry
+        // reference remains live across those calls.
+        ModelFrameReplayEntry plan[256] = {};
+        uint32_t planCount = 0;
+        for (const auto& ownerEntries : g_attached)
+        {
+            for (const AttachEntry& entry : ownerEntries.second)
+            {
+                if (!entry.renderCtx || entry.subObj != sourceRoot) continue;
+                if (!SourceHasDirectTrackedChild(sourceRoot, entry.renderCtx, entry.attachId))
+                    continue;
+
+                bool duplicate = false;
+                for (uint32_t i = 0; i < planCount; ++i)
+                {
+                    if (plan[i].sourceChild == entry.renderCtx &&
+                        plan[i].attachId == entry.attachId)
+                    {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate || planCount >= 256) continue;
+
+                // The native duplicate path recursively attaches with force=false. Once the
+                // clone parent is loaded that silently rejects *any* attachment absent from its
+                // LUT (not only the synthetic collection root): normal capes, some feet, and
+                // model-type helms can all be lost this way. This plan contains only exact WXL
+                // children proven to belong to the live source tree, and native survivors are
+                // skipped below, so force is both necessary and scoped.
+                plan[planCount++] = {
+                    entry.renderCtx,
+                    entry.attachId,
+                    true
+                };
+            }
+        }
+
+        uint32_t survived = 0;
+        uint32_t restored = 0;
+        uint32_t failed = 0;
+        for (uint32_t i = 0; i < planCount; ++i)
+        {
+            const ModelFrameReplayEntry& entry = plan[i];
+
+            // Native survivors (notably shoulders at 5/6) are already in the cloned tree. Match
+            // both source and attachment id because one source model may legitimately be used at
+            // more than one point.
+            if (ModelFrameHasTrackedClone(cloneRoot, entry.sourceChild, entry.attachId))
+            {
+                ++survived;
+                continue;
+            }
+
+            void* cloneChild = DuplicateModelGuarded(scene, entry.sourceChild);
+            if (!cloneChild)
+            {
+                ++failed;
+                continue;
+            }
+
+            AttachModelFrameCloneGuarded(cloneChild, cloneRoot, entry.attachId,
+                                         entry.forceAttach);
+            if (ModelFrameHasTrackedClone(cloneRoot, entry.sourceChild, entry.attachId))
+                ++restored;
+            else
+                ++failed;
+        }
+
+        EquipLog("  ModelFrameReplay: source=0x%p clone=0x%p plan=%u survived=%u restored=%u failed=%u",
+                 sourceRoot, cloneRoot, planCount, survived, restored, failed);
+
+        // Keep one always-on breadcrumb while this client-specific repair is validated. The
+        // verbose equipment log remains opt-in; this line appears at most once per process.
+        static bool replaySummaryLogged = false;
+        if (!replaySummaryLogged)
+        {
+            replaySummaryLogged = true;
+            WLOG_INFO("equip-extension: CharacterModelFrame replay source=%p clone=%p "
+                      "plan=%u survived=%u restored=%u failed=%u",
+                      sourceRoot, cloneRoot, planCount, survived, restored, failed);
+        }
+    }
+
+    static void __fastcall CharacterModelRemoveVisualsDetour(void* cloneRoot,
+                                                              void* /*edx*/)
+    {
+        if (!g_originalCharacterModelRemoveVisuals) return;
+        g_originalCharacterModelRemoveVisuals(cloneRoot);
+        ReplayTrackedModelFrameChildren(cloneRoot);
+    }
+
+    static void InstallCharacterModelFrameHook()
+    {
+        if (!wxl::core::hook::Install(
+                "EquipExtension::CharacterModelRemoveVisuals",
+                kCharacterModelRemoveVisuals,
+                reinterpret_cast<void*>(&CharacterModelRemoveVisualsDetour),
+                reinterpret_cast<void**>(&g_originalCharacterModelRemoveVisuals)))
+            WLOG_ERROR("equip-extension: failed to install CharacterModelFrame RemoveVisuals replay hook");
+    }
+
+    struct EquipExtensionHookRegistrar
+    {
+        EquipExtensionHookRegistrar()
+        {
+            // The matching WarcraftXL_equip-extension.disable flag suppresses both the event
+            // subscribers below and this native repair hook.
+            wxl::runtime::modules::Register("equip-extension",
+                                            &InstallCharacterModelFrameHook);
+        }
+    } g_equipExtensionHookRegistrar;
+#endif
+
+    // CharacterModelFrame support intentionally starts fresh from here. Do not hook the global
+    // RemoveVisuals clone path; Glue character selection shares it.
+
     static bool NeedsManualBoneRemap(const AttachEntry& e) noexcept
     {
         // Full-body collection overlays are attached to the character root and need their
@@ -1530,6 +1775,87 @@ namespace wxl::scripts::equipextension
         }
     }
 
+#if 0
+    // Rejected CharacterModelFrame refresh experiment, retained only for reference. Repeated
+    // SetUnit calls can clone the same Glue attachments again and compound duplicate trees.
+    // The initial Glue/world character can receive its slot events before the retail DB2 snapshot
+    // is published, and it is not guaranteed to subsequently receive a visible M2 per-frame tick.
+    // Drive the delayed CharacterModelFrame clone from the process-wide main-thread update instead.
+    static void QueueModelFrameRefresh() noexcept
+    {
+        if (!g_modelFrameRefreshPending) return;
+
+        if (wxl::runtime::lua::ExecuteCurrent("retail-db2-model-frame-refresh", R"lua(
+if not WXL_RetailModelFrameRefresh and CreateFrame then
+    local refresh = CreateFrame("Frame")
+    refresh.remaining = 0
+    refresh.elapsed = 0
+    refresh.delay = 0
+    refresh.frame = nil
+
+    local function EnsureFrame(self)
+        if self.frame and self.frame == CharacterModelFrame then return true end
+        if not CharacterModelFrame or not CharacterModelFrame.SetUnit or
+           not CharacterModelFrame.HookScript then
+            return false
+        end
+        CharacterModelFrame:HookScript("OnShow", function()
+            if WXL_RetailModelFrameRefresh then
+                WXL_RetailModelFrameRefresh:Queue()
+            end
+        end)
+        self.frame = CharacterModelFrame
+        return true
+    end
+
+    local function OnUpdate(self, elapsed)
+        self.elapsed = self.elapsed + (elapsed or 0)
+        if self.elapsed < self.delay then return end
+        self.elapsed = 0
+
+        -- Glue can publish the DB2 snapshot before CharacterModelFrame exists. Keep this
+        -- lightweight watcher alive until the frame is available, then let its OnShow hook
+        -- handle later openings without a C++ retry loop.
+        if not EnsureFrame(self) then
+            self.delay = 0.50
+            return
+        end
+        if not CharacterModelFrame.IsShown or not CharacterModelFrame:IsShown() then
+            self.remaining = 0
+            self:SetScript("OnUpdate", nil)
+            return
+        end
+
+        CharacterModelFrame:SetUnit("player")
+        self.remaining = self.remaining - 1
+        if self.remaining <= 0 then
+            self:SetScript("OnUpdate", nil)
+        elseif self.remaining == 3 then
+            self.delay = 0.20
+        elseif self.remaining == 2 then
+            self.delay = 0.65
+        else
+            self.delay = 1.50
+        end
+    end
+
+    function refresh:Queue()
+        self.remaining = 4
+        self.elapsed = 0
+        self.delay = 0.05
+        self:SetScript("OnUpdate", OnUpdate)
+    end
+
+    WXL_RetailModelFrameRefresh = refresh
+end
+if WXL_RetailModelFrameRefresh then
+    WXL_RetailModelFrameRefresh:Queue()
+end
+)lua"))
+            g_modelFrameRefreshPending = false;
+    }
+#endif
+
     // ─── Event handler implementations ───────────────────────────────────────────
 
     void EquipExtension::OnItemSlotChange(const ev::ItemSlotChangeArgs& a)
@@ -1556,6 +1882,11 @@ namespace wxl::scripts::equipextension
             if (subObj) RebuildAllModels(cmo);
             return;
         }
+
+        // Let the demand-driven DB2 service derive expensive SKIN/material rows only for equipment
+        // that is actually visible. The request queue is thread-safe; construction and immutable
+        // snapshot publication remain on the loader thread.
+        itemdisplay::Request(displayId);
 
         // Keep live slots registered across both DB2 publication phases. Glue character models and
         // CharacterModelFrame frequently receive their slot events before even the fast model phase.
@@ -1900,34 +2231,51 @@ namespace wxl::scripts::equipextension
         if (subObj) RebuildAllModels(cmo);
     }
 
-    void EquipExtension::OnM2PerFrameUpdate(const ev::M2PerFrameUpdateArgs& a)
+    void EquipExtension::OnUpdate(const ev::UpdateArgs& /*a*/)
     {
-        void* renderCtx = a.renderCtx;
-
-        // Login and ModelFrame construction can dispatch slots before their CMO owns a scene node.
-        // Track publication per slot/CMO rather than globally: a Glue/ModelFrame CMO may consume the
-        // current snapshot before the later in-world CMO even exists. Replaying only when this CMO's
-        // own render context is ticking also avoids scanning/rebuilding every pending character for
-        // every recursively updated child M2.
-        LoadSidecarModels();
+        // The direct/complete retail snapshots are published by a background worker. Poll their
+        // immutable pointer once per main-thread frame so Glue and initial world CMOs do not depend
+        // on receiving a later visible M2 update after their first slot dispatch.
+        if (!g_pendingDb2Slots.empty())
+            LoadSidecarModels();
         if (!g_pendingDb2Slots.empty() && g_itemDisplayIndex)
         {
             const std::vector<PendingDb2Slot> pending = g_pendingDb2Slots;
-            bool refreshed = false;
             for (const PendingDb2Slot& slot : pending)
             {
                 if (!slot.cmo || slot.modelSlot >= 11 || !slot.displayId) continue;
+
+                // Do not rebuild from a model-only snapshot.  For capes such as 253340 that
+                // leaves the original type-3 texture in a T1_T1 batch, producing the translucent
+                // fire effect seen at login.  Request() is set-deduplicated and the worker's
+                // publication makes both the material rows and this resolved bit visible together.
+                if (!g_itemDisplayIndex->resolvedMaterialDisplays.contains(slot.displayId))
+                {
+                    itemdisplay::Request(slot.displayId);
+                    continue;
+                }
+
                 if (slot.appliedIndex == g_itemDisplayIndex) continue;
-                void* sceneNode =
-                    GuardedReadPtr(reinterpret_cast<uint8_t*>(slot.cmo) + m2::kOffCmoSceneNode);
-                if (!sceneNode || sceneNode != renderCtx) continue;
+
+                void* sceneNode = GuardedReadPtr(
+                    reinterpret_cast<uint8_t*>(slot.cmo) + m2::kOffCmoSceneNode);
+                if (!sceneNode) continue;
+
+                // RebuildAllModels needs the scene-node owner for GetRenderCtx. Waiting for it
+                // prevents consuming this snapshot before a newly-created CMO can attach models.
+                void* owner28 = GuardedReadPtr(
+                    reinterpret_cast<uint8_t*>(sceneNode) + m2::kOffSceneNodeOwner);
+                if (!owner28) continue;
+
                 uint32_t displayId = slot.displayId;
                 OnItemSlotChange({slot.cmo, slot.modelSlot, &displayId});
-                refreshed = true;
             }
-            if (refreshed)
-                g_modelFrameRefreshPending = true;
         }
+    }
+
+    void EquipExtension::OnM2PerFrameUpdate(const ev::M2PerFrameUpdateArgs& a)
+    {
+        void* renderCtx = a.renderCtx;
 
         if (g_attached.empty()) return;
 
@@ -1963,27 +2311,6 @@ namespace wxl::scripts::equipextension
             for (const auto& e : entries)
                 if (!e.renderCtx) { hasPending = true; break; }
             if (hasPending) { RebuildAllModels(cmo); return; }
-
-            // CharacterModelFrame is a native clone of this tree. A clone made during an earlier DB2
-            // phase cannot gain collection children that did not exist yet. Wait until every rebuilt
-            // child on the live character has a render context, then reclone on the next UI update.
-            if (g_modelFrameRefreshPending)
-            {
-                g_modelFrameRefreshPending = false;
-                wxl::runtime::lua::ExecuteCurrent("retail-db2-model-frame-refresh", R"lua(
-if CharacterModelFrame and CharacterModelFrame.IsShown and CharacterModelFrame:IsShown() then
-    if not WXL_RetailModelFrameRefresh then
-        WXL_RetailModelFrameRefresh = CreateFrame("Frame")
-    end
-    WXL_RetailModelFrameRefresh:SetScript("OnUpdate", function(self)
-        self:SetScript("OnUpdate", nil)
-        if CharacterModelFrame and CharacterModelFrame:IsShown() then
-            CharacterModelFrame:SetUnit("player")
-        end
-    end)
-end
-)lua");
-            }
 
             // charBuf: character bone palette. Valid when the character model is rendering.
             auto* charBuf = reinterpret_cast<uint8_t*>(
@@ -2527,6 +2854,7 @@ end
             WLOG_WARN("equip-extension: disabled by client flag");
             return;
         }
+        on<&EquipExtension::OnUpdate>(ev::Event::OnUpdate);
         on<&EquipExtension::OnItemSlotChange>(ev::Event::OnItemSlotChange);
         on<&EquipExtension::OnItemSlotClear>(ev::Event::OnItemSlotClear);
         on<&EquipExtension::OnM2SkinFinalize>(ev::Event::OnM2SkinFinalize);
