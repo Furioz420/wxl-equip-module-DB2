@@ -25,6 +25,7 @@ namespace wxl::scripts::equipextension
         EquipExtension();
 
     private:
+        void OnUpdate(const wxl::events::UpdateArgs& a);
         void OnItemSlotChange(const wxl::events::ItemSlotChangeArgs& a);
         void OnItemSlotClear(const wxl::events::ItemSlotClearArgs& a);
         void OnM2SkinFinalize(const wxl::events::M2SkinFinalizeArgs& a);
